@@ -135,37 +135,63 @@ if st.button("분석"):
             f"${stoploss}"
         )
 
-        
+        st.subheader("📊 AI 종합 분석")
 
-        st.subheader("기술적 분석")
+        strengths = []
+        warnings = []
 
-        st.write(f"20일 이동평균: {ma20:.2f}")
-        st.write(f"50일 이동평균: {ma50:.2f}")
-        st.write(f"RSI: {rsi:.1f}")
+        if current_price > ma20:
+            strengths.append("주가가 20일 이동평균선 위에 있습니다.")
+
+        if current_price > ma50:
+            strengths.append("주가가 50일 이동평균선 위에 있습니다.")
 
         if rsi > 70:
-            st.warning("과매수 구간")
+            warnings.append("RSI 과매수 상태로 단기 조정 가능성이 있습니다.")
 
         elif rsi < 30:
-            st.info("과매도 구간")
-st.subheader("📊 AI 종합 분석")
+            strengths.append("RSI 과매도 구간으로 반등 가능성이 있습니다.")
 
-if score >= 80:
-    st.success("강력 매수 구간입니다. 추세가 매우 강합니다.")
-elif score >= 65:
-    st.info("매수 가능 구간입니다. 다만 분할매수를 권장합니다.")
-elif score >= 50:
-    st.warning("관망 구간입니다. 방향성 확인이 필요합니다.")
-else:
-    st.error("주의 구간입니다. 보수적 접근이 필요합니다.")
+        st.markdown("### ✅ 강점")
 
-st.subheader("🤖 AI 최종 의견")
+        for s in strengths:
+            st.write("•", s)
 
-if rsi > 70:
-    st.write("현재 과매수 상태입니다. 추격매수는 주의가 필요합니다.")
-elif rsi < 30:
-    st.write("현재 과매도 상태입니다. 반등 가능성을 확인해볼 수 있습니다.")
-else:
-    st.write("기술적 지표는 중립 수준입니다.")
+        st.markdown("### ⚠️ 주의사항")
+
+        if warnings:
+            for w in warnings:
+                st.write("•", w)
+        else:
+            st.write("• 특별한 위험 신호 없음")
+
+        st.markdown("### 🎯 투자 전략")
+
+        if score >= 80:
+            st.success("강력 매수 구간. 추세가 매우 강합니다.")
+
+        elif score >= 65:
+            st.info("매수 가능 구간. 다만 분할매수를 권장합니다.")
+
+        elif score >= 50:
+            st.warning("관망 구간. 방향성 확인이 필요합니다.")
+
+        else:
+            st.error("주의 구간. 보수적 접근이 필요합니다.")
+
+        st.markdown("### 🤖 AI 최종 의견")
+
+        if score >= 80:
+            st.write("현재 추세는 매우 강하며 중장기 상승 가능성이 높습니다.")
+
+        elif score >= 65:
+            st.write("상승 추세는 유지되고 있으나 단기 과열 여부를 확인해야 합니다.")
+
+        elif score >= 50:
+            st.write("추세가 불분명합니다. 추가 확인 후 진입하는 것이 좋습니다.")
+
+        else:
+            st.write("하락 위험이 존재합니다. 신규 진입은 신중하게 접근하세요.")
+
     except Exception as e:
         st.error(str(e))
