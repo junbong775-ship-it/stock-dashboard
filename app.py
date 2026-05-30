@@ -16,23 +16,16 @@ def get_tickers(market):
     except: return []
     return []
 
-# [핵심] 이평선 밀집도 계산 함수
 def calculate_density(ticker):
     try:
-        # 데이터가 너무 크면 느려지므로 6개월치만 사용
         df = yf.download(ticker, period="6mo", progress=False)
         if len(df) < 60: return None
-        
-        # 5, 20, 60일 이동평균선
         ma5 = df['Close'].rolling(5).mean().iloc[-1]
         ma20 = df['Close'].rolling(20).mean().iloc[-1]
         ma60 = df['Close'].rolling(60).mean().iloc[-1]
-        
-        # 평균값들 간의 표준편차(밀집도) - 작을수록 밀집됨
         density = pd.Series([ma5, ma20, ma60]).std() / ma20 * 100
         return round(density, 2)
-    except:
-        return None
+    except: return None
 
 def main():
     st.title("📈 이평선 밀집 스캐너")
@@ -44,14 +37,18 @@ def main():
             results = []
             progress_bar = st.progress(0)
             for i, ticker in enumerate(tickers):
-                density = calculate_density(ticker)
-                if density is not None:
-                    results.append({"종목": ticker, "밀집도(%)": density})
+                val = calculate_density(ticker)
+                # 데이터가 성공적으로 계산되었을 때만 추가
+                if val is not None:
+                    results.append({"종목": ticker, "밀집도": val})
                 progress_bar.progress((i + 1) / len(tickers))
             
-            # 밀집도 낮은 순(가장 밀집된 순)으로 정렬
-            df_res = pd.DataFrame(results).sort_values(by="밀집도(%)")
-            st.table(df_res)
+            if results:
+                # '밀집도'라는 이름으로 통일해서 정렬
+                df_res = pd.DataFrame(results).sort_values(by="밀집도")
+                st.table(df_res)
+            else:
+                st.write("계산할 데이터가 없습니다.")
         else:
             st.error("데이터를 가져올 수 없습니다.")
 
