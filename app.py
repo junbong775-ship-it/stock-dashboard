@@ -1,56 +1,26 @@
-import streamlit as st
-import yfinance as yf
-import pandas as pd
-import FinanceDataReader as fdr
+import plotly.graph_objects as go
 
-st.set_page_config(layout="wide")
+# 1. AI 스코어 게이지 (원형 차트)
+def draw_gauge(score):
+    fig = go.Figure(go.Indicator(
+        mode = "gauge+number",
+        value = score,
+        gauge = {'axis': {'range': [0, 100]},
+                 'bar': {'color': "#FF4B4B"}}, # 빨간색 바
+        domain = {'x': [0, 1], 'y': [0, 1]}
+    ))
+    fig.update_layout(height=200, margin=dict(t=0, b=0))
+    return fig
 
-@st.cache_data
-def get_tickers(market):
-    try:
-        if market == "S&P 500": return fdr.StockListing('S&P500')['Symbol'].tolist()[:20]
-        if market == "나스닥 100": return fdr.StockListing('NASDAQ')['Symbol'].tolist()[:20]
-        df = fdr.StockListing('KRX')
-        if market == "코스피 200": return df[df['Market'] == 'KOSPI']['Code'].tolist()[:20]
-        if market == "코스닥 150": return df[df['Market'] == 'KOSDAQ']['Code'].tolist()[:20]
-    except: return []
-    return []
+# 2. tab1 내부 로직
+with tab1:
+    st.subheader("TE - T1 Energy Inc.")
+    # 현재가와 변동률을 열로 배치
+    col1, col2, col3 = st.columns(3)
+    col1.metric("현재가", "$10.82", "+1.2%")
+    col2.metric("30일 변동", "+157.0%")
+    col3.metric("RSI 상태", "과매수")
 
-def calculate_density(ticker):
-    try:
-        df = yf.download(ticker, period="6mo", progress=False)
-        if len(df) < 60: return None
-        ma5 = df['Close'].rolling(5).mean().iloc[-1]
-        ma20 = df['Close'].rolling(20).mean().iloc[-1]
-        ma60 = df['Close'].rolling(60).mean().iloc[-1]
-        density = pd.Series([ma5, ma20, ma60]).std() / ma20 * 100
-        return round(density, 2)
-    except: return None
-
-def main():
-    st.title("📈 이평선 밀집 스캐너")
-    market = st.radio("시장 선택", ["S&P 500", "나스닥 100", "코스피 200", "코스닥 150"], horizontal=True)
-    
-    if st.button("스캔 시작"):
-        tickers = get_tickers(market)
-        if tickers:
-            results = []
-            progress_bar = st.progress(0)
-            for i, ticker in enumerate(tickers):
-                val = calculate_density(ticker)
-                # 데이터가 성공적으로 계산되었을 때만 추가
-                if val is not None:
-                    results.append({"종목": ticker, "밀집도": val})
-                progress_bar.progress((i + 1) / len(tickers))
-            
-            if results:
-                # '밀집도'라는 이름으로 통일해서 정렬
-                df_res = pd.DataFrame(results).sort_values(by="밀집도")
-                st.table(df_res)
-            else:
-                st.write("계산할 데이터가 없습니다.")
-        else:
-            st.error("데이터를 가져올 수 없습니다.")
-
-if __name__ == "__main__":
-    main()
+    # 게이지 차트 출력
+    st.plotly_chart(draw_gauge(45), use_container_width=True)
+    st.markdown("### 등급: [ A ]")
