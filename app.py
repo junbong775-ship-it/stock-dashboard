@@ -10,41 +10,60 @@ from deep_translator import GoogleTranslator
 TARGET_MULT   = 1.30
 STOPLOSS_MULT = 0.82
 
-US_TICKERS = [
-    'MSFT', 'AAPL', 'NVDA', 'TSLA', 'AMZN', 'META', 'GOOGL', 'AVGO', 'AMD', 'NFLX',
-    'ADBE', 'CRM',  'ORCL', 'COST', 'PEP',  'KO',   'MCD',   'WMT',  'PG',  'CVX',
-    'XOM',  'JPM',  'BAC',  'DIS',  'PFE',  'ABBV', 'TMO',   'DHR',  'HON', 'GE',
-]
+import streamlit as st
+import yfinance as yf
+import pandas as pd
+import FinanceDataReader as fdr
+import time
 
-# 6-digit KRX codes (no .KS suffix needed for fdr)
-KR_TICKERS = [
-    '005930', '000660', '373220', '207940', '005380',
-    '005490', '035720', '035420', '051910', '068270',
-    '034730', '105560', '012330', '006400', '066570',
-    '055550', '017670', '000270', '012450', '011200',
-    '096770', '028260', '003550', '032830', '086790',
-    '018260', '009150', '010130', '138040', '030200',
-]
+# --- 시장별 종목 리스트 가져오는 함수 ---
+@st.cache_data
+def get_tickers(market):
+    if market == "S&P 500":
+        df = fdr.StockListing('S&P500')
+        return df['Symbol'].tolist()[:100]  # 속도를 위해 상위 100개만
+    elif market == "나스닥 100":
+        # NASDAQ 전체 중 시총 상위 100개 추출
+        df = fdr.StockListing('NASDAQ')
+        return df['Symbol'].tolist()[:100]
+    elif market == "코스피 200":
+        df = fdr.StockListing('KRX-KOSPI')
+        return df['Code'].tolist()[:100]
+    elif market == "코스닥 150":
+        df = fdr.StockListing('KRX-KOSDAQ')
+        return df['Code'].tolist()[:100]
+    elif market == "러셀 2000":
+        # NYSE/AMEX/NASDAQ 합친 목록 등에서 필터링
+        df = fdr.StockListing('NYSE')
+        return df['Symbol'].tolist()[:100]
+    return []
 
-# Display names for the pre-defined scanner list
-KR_NAMES: dict[str, str] = {
-    '005930': '삼성전자',           '000660': 'SK하이닉스',
-    '373220': 'LG에너지솔루션',     '207940': '삼성바이오로직스',
-    '005380': '현대차',             '005490': 'POSCO홀딩스',
-    '035720': '카카오',             '035420': '네이버',
-    '051910': 'LG화학',             '068270': '셀트리온',
-    '034730': 'SK',                 '105560': 'KB금융',
-    '012330': '현대모비스',         '006400': '삼성SDI',
-    '066570': 'LG전자',             '055550': '신한지주',
-    '017670': 'SK텔레콤',           '000270': '기아',
-    '012450': '한화에어로스페이스',  '011200': 'HMM',
-    '096770': 'SK이노베이션',       '028260': '삼성물산',
-    '003550': 'LG',                 '032830': '삼성생명',
-    '086790': '하나금융지주',       '018260': '삼성에스디에스',
-    '009150': '삼성전기',           '010130': '고려아연',
-    '138040': '메리츠금융지주',     '030200': 'KT',
-}
+# --- 메인 화면 ---
+st.title("📈 자동 종목 스캐너")
 
+# 탭 생성
+tabs = ["S&P 500", "나스닥 100", "러셀 2000", "코스피 200", "코스닥 150"]
+selected_tab = st.tabs(tabs)
+
+# --- 각 탭 로직 ---
+for i, tab in enumerate(selected_tab):
+    with tab:
+        market = tabs[i]
+        if st.button(f"{market} 스캔 시작"):
+            tickers = get_tickers(market)
+            st.write(f"총 {len(tickers)}개 종목 스캔 중...")
+            
+            # 스캔 로직 (이평선 계산 등)
+            for ticker in tickers:
+                try:
+                    df = yf.download(ticker, period="1y", progress=False)
+                    if not df.empty:
+                        df['MA20'] = df['Close'].rolling(window=20).mean()
+                        # 여기에 원하시는 조건문 추가
+                        # 예: if df['Close'].iloc[-1] > df['MA20'].iloc[-1]: ...
+                except:
+                    continue
+            st.success("스캔 완료!")
 GRADE_COLOR: dict[str, str] = {
     'SSS': '#FFD700', 'SS': '#FF8C00', 'S':  '#00C851',
     'A':   '#2196F3', 'B':  '#9E9E9E', 'C':  '#FF5722', 'D': '#F44336',
