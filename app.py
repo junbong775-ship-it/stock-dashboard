@@ -148,24 +148,6 @@ if st.button("분석"):
 
         elif rsi < 30:
             st.info("과매도 구간")
-st.subheader("📊 AI 종합 분석")
 
-if score >= 80:
-    st.success("강력 매수 구간입니다. 추세가 매우 강합니다.")
-elif score >= 65:
-    st.info("매수 가능 구간입니다. 다만 분할매수를 권장합니다.")
-elif score >= 50:
-    st.warning("관망 구간입니다. 방향성 확인이 필요합니다.")
-else:
-    st.error("주의 구간입니다. 보수적 접근이 필요합니다.")
-
-st.subheader("🤖 AI 최종 의견")
-
-if rsi > 70:
-    st.write("현재 과매수 상태입니다. 추격매수는 주의가 필요합니다.")
-elif rsi < 30:
-    st.write("현재 과매도 상태입니다. 반등 가능성을 확인해볼 수 있습니다.")
-else:
-    st.write("기술적 지표는 중립 수준입니다.")
     except Exception as e:
         st.error(str(e))
