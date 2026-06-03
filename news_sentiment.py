@@ -1,0 +1,111 @@
+"""Lightweight lexicon-based sentiment analysis for stock-news headlines.
+
+No external LLM dependency — deterministic keyword scoring tuned for Korean +
+English financial vocabulary. Provides a per-article label and a 0-100 overall
+score for a set of articles. Korean keywords are matched as substrings (the
+language is agglutinative, so particles attach to stems); English keywords are
+matched with word boundaries to avoid substring false positives.
+"""
+from __future__ import annotations
+
+import re
+
+LABEL_POSITIVE = 'positive'
+LABEL_NEGATIVE = 'negative'
+LABEL_NEUTRAL = 'neutral'
+
+_POSITIVE = {
+    # Korean
+    '상승', '급등', '강세', '호재', '신고가', '돌파', '개선', '흑자', '성장',
+    '수주', '계약', '호실적', '최대', '사상최대', '증가', '확대', '매수', '상향',
+    '기대', '반등', '회복', '인수', '협력', '파트너십', '제휴', '투자', '승인',
+    '출시', '성공', '호조', '수혜', '신제품', '훈풍', '낙관', '플러스', '흥행',
+    # English
+    'surge', 'soar', 'soars', 'jump', 'jumps', 'rally', 'gain', 'gains', 'rise',
+    'rises', 'beat', 'beats', 'record', 'high', 'highs', 'upgrade', 'upgraded',
+    'growth', 'profit', 'profits', 'strong', 'boost', 'partnership', 'deal',
+    'win', 'wins', 'approval', 'approved', 'launch', 'launches', 'outperform',
+    'bullish', 'rebound', 'breakthrough', 'expansion', 'optimistic', 'buy',
+}
+
+_NEGATIVE = {
+    # Korean
+    '하락', '급락', '폭락', '약세', '악재', '우려', '적자', '손실', '감소',
+    '축소', '매도', '하향', '부진', '경고', '리스크', '위기', '소송', '조사',
+    '제재', '파산', '결함', '리콜', '부정', '실패', '충격', '둔화', '감원',
+    '구조조정', '디폴트', '청산', '급감', '쇼크', '악화', '비관', '논란',
+    # English
+    'fall', 'falls', 'drop', 'drops', 'plunge', 'plunges', 'slump', 'loss',
+    'losses', 'miss', 'misses', 'downgrade', 'downgraded', 'weak', 'cut',
+    'cuts', 'lawsuit', 'probe', 'recall', 'warning', 'warn', 'risk', 'bearish',
+    'decline', 'declines', 'concern', 'concerns', 'layoff', 'layoffs',
+    'bankruptcy', 'default', 'crash', 'tumble', 'sink', 'sinks', 'sell',
+}
+
+
+def _word_in(word: str, text: str) -> bool:
+    if word.isascii():
+        return re.search(r'\b' + re.escape(word) + r'\b', text) is not None
+    return word in text
+
+
+def _count_hits(text: str) -> tuple[int, int]:
+    if not text:
+        return 0, 0
+    lower = text.lower()
+    pos = sum(1 for w in _POSITIVE if _word_in(w, lower))
+    neg = sum(1 for w in _NEGATIVE if _word_in(w, lower))
+    return pos, neg
+
+
+def analyze(text: str) -> tuple[str, float]:
+    """Return (label, score) for one headline. score is in [-1.0, 1.0]."""
+    pos, neg = _count_hits(text)
+    total = pos + neg
+    if total == 0:
+        return LABEL_NEUTRAL, 0.0
+    score = (pos - neg) / total
+    if score > 0.15:
+        return LABEL_POSITIVE, score
+    if score < -0.15:
+        return LABEL_NEGATIVE, score
+    return LABEL_NEUTRAL, score
+
+
+def overall_score(articles: list[dict]) -> int:
+    """0-100 overall sentiment from articles carrying a 'sent_score' in [-1, 1]."""
+    scores = [float(a.get('sent_score', 0.0)) for a in articles]
+    if not scores:
+        return 50
+    mean = sum(scores) / len(scores)
+    return max(0, min(100, int(round(50 + mean * 50))))
+
+
+def overall_label(score: int) -> tuple[str, str]:
+    """Return (emoji, korean_label) for a 0-100 overall score."""
+    if score >= 80:
+        return '🟢', '매우 긍정적'
+    if score >= 60:
+        return '🟢', '긍정적'
+    if score >= 40:
+        return '⚪', '중립적'
+    if score >= 20:
+        return '🔴', '부정적'
+    return '🔴', '매우 부정적'
+
+
+def overall_color(score: int) -> str:
+    if score >= 60:
+        return '#2ecc71'
+    if score >= 40:
+        return '#9aa0b5'
+    return '#e74c3c'
+
+
+def label_badge(label: str) -> tuple[str, str, str]:
+    """Return (emoji, korean_label, color) for a per-article sentiment label."""
+    if label == LABEL_POSITIVE:
+        return '🟢', '긍정적', '#2ecc71'
+    if label == LABEL_NEGATIVE:
+        return '🔴', '부정적', '#e74c3c'
+    return '⚪', '중립적', '#9aa0b5'

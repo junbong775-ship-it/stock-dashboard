@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.pythonlibs/
+.replit
+.replit-artifact/
+.DS_Store
