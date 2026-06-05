@@ -25,14 +25,13 @@ GRADE_COLOR: dict[str, str] = {
 # ──────────────────────────────────────────────────────────────────────────────
 
 _PATTERN_WEIGHTS: dict[str, int] = {
-    'ma10_pullback':  12,  # 10일선 눌림목 — 저위험 진입, 가장 높은 신뢰
-    'ma20_pullback':  10,  # 20일선 눌림목 — 중기 지지 확인
+    'first_pullback': 12,  # 첫 눌림목 — 저위험 진입, 가장 높은 신뢰
     'new_high':        9,  # 52주 신고가 돌파
+    'ma300_breakout':  9,  # 300일선 돌파 시도
     'golden_cross':    8,  # MA20 > MA60 골든크로스
+    'ma_convergence':  8,  # 5·10·20일선 수렴
     'cup_and_handle':  8,  # 컵앤핸들 — 중장기 반등
     'double_bottom':   8,  # 더블바텀 — 바닥 반전
-    'box_breakout':    7,  # 박스권 돌파
-    'volume_surge':    6,  # 거래량 급증
 }
 
 
@@ -187,12 +186,11 @@ def calculate_ai_score(data: dict) -> dict:
     ma300_near = abs_dev is not None and abs_dev <= 5.0
     ma300_aligned = (ma20 is not None and ma60 is not None and ma120 is not None
                      and ma300 is not None and ma20 > ma60 > ma120 > ma300)
-    # 첫 눌림목 — 정배열 눌림목 패턴(MA10/MA20)
-    first_pullback = bool(pattern_data.get('ma10_pullback', (False,))[0]
-                          or pattern_data.get('ma20_pullback', (False,))[0])
-    # 거래량 증가 — 거래량 급증 패턴 또는 최근 5일 평균 > 직전 20일 평균 ×1.15
-    vol_increase = bool(pattern_data.get('volume_surge', (False,))[0])
-    if not vol_increase and 'Volume' in hist.columns:
+    # 첫 눌림목 — 정배열 눌림목 패턴(MA10/MA20 통합)
+    first_pullback = bool(pattern_data.get('first_pullback', (False,))[0])
+    # 거래량 증가 — 최근 5일 평균 > 직전 20일 평균 ×1.15
+    vol_increase = False
+    if 'Volume' in hist.columns:
         v = hist['Volume'].dropna()
         if len(v) >= 25:
             recent = float(v.tail(5).mean())
@@ -274,71 +272,35 @@ RATING_META: dict[str, tuple[str, str, str]] = {
     'AVOID': ('회피', '#F44336', '추세·점수 약함 — 신규 진입 비권장'),
 }
 
-# 액션 → 최종판단 (1:1 매핑): (액션 라벨, 최종판단, 색상)
-# 최종판단은 오직 손익비(R/R)로만 결정한다 — 전략 분류(classify_strategies)와 완전히 분리.
-#   R/R < 1   → 제외 (스캐너 결과에서 제거)
-#   R/R 1~2   → 관망
-#   R/R 2~3   → 선매집
-#   R/R 3~5   → 매수      (지금 진입 가능)
-#   R/R 5 이상 → 적극매수  (지금 진입 가능)
-# '지금 진입 가능' 문구는 R/R 3 이상(매수·적극매수)에서만 노출된다.
+# 액션(최종판단) — 단 하나의 최종 결정. 투자의견(매수 자격) + 진입구간 위치를 결합한다.
+#   매수 + 진입구간 도달  → 바로 진입(ENTER)
+#   매수 + 진입구간 근처  → 분할 진입(SPLIT)
+#   매수 + 진입구간 위    → 관찰리스트(WATCH)
+#   조건 미충족(매수의견 아님·매수 차단) → 제외(EXCLUDE)
 ACTION_META: dict[str, tuple[str, str, str]] = {
-    'STRONG_BUY': ('적극매수', '지금 진입 가능', '#00C851'),
-    'BUY':        ('매수',     '지금 진입 가능', '#00E676'),
-    'ACCUMULATE': ('선매집',   '분할 매수 대기', '#2196F3'),
-    'WATCH':      ('관망',     '대기',          '#FFB300'),
-    'EXCLUDE':    ('제외',     '제외',          '#9E9E9E'),
+    'ENTER':   ('바로 진입',  '진입구간 내부 — 즉시 매수 가능',  '#00C851'),
+    'SPLIT':   ('분할 진입',  '진입구간 상단 +10% 이내 — 분할 매수', '#2196F3'),
+    'WATCH':   ('관찰리스트', '진입구간 +10% 이상 — 눌림 대기',  '#FFB300'),
+    'EXCLUDE': ('제외',       '조건 미충족 — 신규 매수 보류',    '#F44336'),
 }
 
-# 진입 타이밍 — 현재가와 진입구간 상단(entry_high) 비교로 결정한다.
-#   상단 +1% 이내 (허용밴드)    → 지금 진입 가능
-#   상단 +1~3% (추격 위험 구간) → 추격매수 주의
-#   상단 +3% 초과 (과대 이격)   → 눌림 대기
-# 매수 계열(BUY/STRONG_BUY)에서만 최종판단·액션 표시에 반영한다.
-# entry_high 는 '현재가 이하의 MA10/MA20'로 산출돼 정의상 현재가 이하가 되므로,
-# +1% 허용밴드가 없으면 '지금 진입 가능'(READY)이 사실상 도달 불가능해진다.
-# (1.5%는 READY 비중이 과도(나스닥100 ~58%)해 변별력이 떨어져 1.0%를 채택.)
+# 진입구간(매수 밴드 상단) 대비 현재가 위치 밴드.
+#   현재가 ≤ 상단×(1+1%)         → 진입구간 내부/도달 → 바로 진입
+#   상단×(1+1%) < 현재가 < ×(1+10%) → 진입구간 상단 근처 → 분할 진입
+#   현재가 ≥ 상단×(1+10%)        → 진입구간 위(상당 이격) → 관찰리스트
+# 강세 돌파주가 진입구간보다 약간 위라는 이유만으로 관찰리스트로 밀리지 않도록
+# 분할 진입 밴드를 +10% 직전까지 넓게 잡는다(과거 +3%는 지나치게 보수적이었음).
 ENTRY_READY_BAND = 0.01
-ENTRY_CHASE_BAND = 0.03
-ENTRY_TIMING_META: dict[str, tuple[str, str]] = {
-    'READY': ('지금 진입 가능', '#00E676'),
-    'CHASE': ('추격매수 주의', '#FFB300'),
-    'WAIT':  ('눌림 대기',     '#FF7043'),
-}
-
-
-def _entry_timing(price: float, entry_high: float) -> str:
-    """현재가가 진입구간 상단보다 얼마나 위인지로 진입 타이밍을 분류한다.
-
-    READY: 상단 +1%(`ENTRY_READY_BAND`) 이내 · CHASE: +1~3% · WAIT: +3% 초과.
-    """
-    if entry_high is None or entry_high <= 0:
-        return 'READY'
-    gap = (price - entry_high) / entry_high
-    if gap <= ENTRY_READY_BAND:
-        return 'READY'
-    if gap <= ENTRY_CHASE_BAND:
-        return 'CHASE'
-    return 'WAIT'
+ENTRY_CHASE_BAND = 0.10
 
 
 def action_view(research: dict) -> tuple[str, str, str]:
-    """액션 카드 표시값(액션 라벨, 최종판단, 색)을 반환한다.
+    """액션 카드 표시값(액션 라벨, 부가설명, 색)을 반환한다 — 단 하나의 최종 행동.
 
-    매수 계열(BUY/STRONG_BUY)은 진입 타이밍(현재가 vs 진입구간 상단)을 최종판단·
-    액션에 반영한다. 그 외 액션은 기존 ACTION_META 표시를 그대로 사용한다.
-      READY → 지금 진입 가능 · CHASE → 추격매수 주의 · WAIT → 눌림 대기(액션도 전환)
+    최종판단(액션)은 투자의견(매수 자격) + 진입구간 위치로 결정된다(ACTION_META 1:1 매핑).
     """
-    action = research.get('action', 'WATCH')
-    base_ko, base_final, base_col = ACTION_META.get(action, ('관망', '대기', '#9E9E9E'))
-    timing = research.get('entry_timing')
-    if action in ('BUY', 'STRONG_BUY') and timing in ENTRY_TIMING_META:
-        t_text, t_col = ENTRY_TIMING_META[timing]
-        if timing == 'WAIT':
-            # 진입구간 상단 +3% 초과 — '매수'는 오해 소지가 커 액션을 '눌림 대기'로 전환
-            return '눌림 대기', t_text, t_col
-        return base_ko, t_text, t_col
-    return base_ko, base_final, base_col
+    action = research.get('action', 'EXCLUDE')
+    return ACTION_META.get(action, ACTION_META['EXCLUDE'])
 
 # 목표가 멀티플 (T1 단기 / T2 중기 / T3 장기)
 TARGET_MULTS: tuple[float, float, float] = (1.10, 1.20, 1.30)
@@ -393,22 +355,27 @@ def _decide_rating(score: int, stage: str) -> str:
     return 'HOLD'
 
 
-def _decide_action(rr: float) -> str:
-    """최종판단(액션)을 손익비(R/R)만으로 결정한다.
+def _decide_action(rating: str, price: float, entry_high: float | None,
+                   buy_blocked: bool = False) -> str:
+    """단 하나의 최종 행동(액션)을 결정한다 — 투자의견 + 진입구간 위치.
 
-    전략 분류(classify_strategies)·투자의견(rating)과 독립적으로 동작하며,
-    최종판단 라벨은 ACTION_META 에서 1:1 로 자동 연동된다.
-      R/R < 1 → 제외 · 1~2 → 관망 · 2~3 → 선매집 · 3~5 → 매수 · 5+ → 적극매수
+    이 값이 화면에 표시되는 유일한 최종 결정이며, 투자의견(rating)과 충돌하지 않도록
+    rating 을 액션 안으로 흡수한다.
+      · 조건 미충족(매수의견 아님·매수 차단)            → 제외(EXCLUDE)
+      · 매수 + 진입구간 내부/도달(현재가 ≤ 상단×1.01)     → 바로 진입(ENTER)
+      · 매수 + 상단 근처(상단×1.01 < 현재가 < ×1.10)     → 분할 진입(SPLIT)
+      · 매수 + 상단 +10% 이상(현재가 ≥ 상단×1.10)        → 관찰리스트(WATCH)
     """
-    if rr < 1.0:
+    if buy_blocked or rating != 'BUY':
         return 'EXCLUDE'
-    if rr < 2.0:
+    if not entry_high or entry_high <= 0 or not price or price <= 0:
         return 'WATCH'
-    if rr < 3.0:
-        return 'ACCUMULATE'
-    if rr < 5.0:
-        return 'BUY'
-    return 'STRONG_BUY'
+    gap = (price - entry_high) / entry_high       # 진입 밴드 상단 대비 현재가 이격
+    if gap <= ENTRY_READY_BAND:
+        return 'ENTER'
+    if gap < ENTRY_CHASE_BAND:
+        return 'SPLIT'
+    return 'WATCH'
 
 
 def _entry_zone(hist, price: float) -> tuple[float, float]:
@@ -425,6 +392,148 @@ def _entry_zone(hist, price: float) -> tuple[float, float]:
     if entry_low > entry_high:
         entry_low, entry_high = entry_high * 0.97, entry_high
     return entry_low, entry_high
+
+
+# ══════════════════════════════════════════════════════════════════════════════════
+# 추세 품질 진단 — 이평선 기울기 · 데드크로스 · 거래량 상태 · 실적 급락 가드
+# (단순 정배열만 보지 않고 추세의 '방향성·건전성'을 함께 평가하기 위한 헬퍼)
+# ══════════════════════════════════════════════════════════════════════════════════
+
+def _ma_slope(hist, col: str, lookback: int = 5) -> tuple[str, float]:
+    """이동평균선 기울기 — 최근 lookback봉 변화율(%)과 방향 라벨.
+
+    반환: (label, pct)  label ∈ {상승, 하락, 횡보, '—'(데이터 부족)}
+    """
+    if col not in hist.columns:
+        return '—', 0.0
+    s = hist[col].dropna()
+    if len(s) < lookback + 1:
+        return '—', 0.0
+    last = float(s.iloc[-1])
+    prev = float(s.iloc[-1 - lookback])
+    if prev == 0:
+        return '횡보', 0.0
+    pct = (last - prev) / abs(prev) * 100.0
+    label = '상승' if pct > 0.5 else '하락' if pct < -0.5 else '횡보'
+    return label, round(pct, 2)
+
+
+def compute_ma_slopes(hist) -> dict:
+    """MA5/10/20 기울기를 한 번에 계산한다. (MA20은 10봉 기준으로 평활)"""
+    return {
+        'ma5':  _ma_slope(hist, 'MA5', 5),
+        'ma10': _ma_slope(hist, 'MA10', 5),
+        'ma20': _ma_slope(hist, 'MA20', 10),
+    }
+
+
+def detect_dead_cross(hist, lookback: int = 20) -> bool:
+    """데드크로스 — MA20이 MA60을 최근 lookback봉 내 하향 돌파(골든크로스의 반대)."""
+    if 'MA20' not in hist.columns or 'MA60' not in hist.columns:
+        return False
+    w = hist.dropna(subset=['MA20', 'MA60']).tail(lookback + 2)
+    if len(w) < 2:
+        return False
+    a = w['MA20'].values
+    b = w['MA60'].values
+    for i in range(1, min(lookback, len(a))):
+        idx = len(a) - 1 - i
+        if idx < 1:
+            break
+        if a[idx] < b[idx] and a[idx - 1] >= b[idx - 1]:
+            return True
+    return False
+
+
+def volume_state(hist) -> tuple[str, float]:
+    """거래량 상태 — 최근 5일 평균 / 직전 20일 평균 비율과 라벨.
+
+    반환: (label, ratio)  label ∈ {급증, 증가, 보통, 감소, '—'}
+    """
+    if 'Volume' not in hist.columns:
+        return '—', 0.0
+    v = hist['Volume'].dropna()
+    if len(v) < 25:
+        return '—', 0.0
+    recent = float(v.tail(5).mean())
+    base   = float(v.tail(25).head(20).mean())
+    if base <= 0:
+        return '—', 0.0
+    ratio = recent / base
+    label = ('급증' if ratio >= 2.0 else
+             '증가' if ratio >= 1.2 else
+             '감소' if ratio < 0.8 else '보통')
+    return label, round(ratio, 2)
+
+
+def detect_earnings_shock(hist, lookback: int = 12, drop_pct: float = 7.0) -> bool:
+    """실적 발표 후 급락(추정) — 최근 lookback봉 중 하루 종가 낙폭이 drop_pct% 이상.
+
+    무료 데이터에 실적 캘린더가 없어, 단일봉 급락(갭다운 포함)으로 근사한다.
+    """
+    c = hist['Close'].dropna()
+    if len(c) < lookback + 1:
+        return False
+    rets = c.pct_change().tail(lookback) * 100.0
+    return bool((rets <= -drop_pct).any())
+
+
+def earnings_reaction_guard(hist) -> bool:
+    """매수 금지 신호 — 실적 급락 + 이평선 하락 + 데드크로스 동시 충족.
+
+    이 조합이면 단순 정배열이어도 신규 매수를 막고 관망/제외로 강등한다.
+    (스펙 5: '실적 발표 후 급락 + 이평선 하락 + 데드크로스 → 매수 금지'.)
+    """
+    slopes = compute_ma_slopes(hist)
+    valid  = [slopes[k] for k in ('ma5', 'ma10', 'ma20') if slopes[k][0] != '—']
+    if len(valid) < 2:
+        return False
+    ma_down = all(lbl == '하락' for lbl, _ in valid)
+    return ma_down and detect_dead_cross(hist) and detect_earnings_shock(hist)
+
+
+# ── 메인 스캐너 표시용 — 대표 패턴명 · 패턴 진행률(0~100) · 국면 라벨 ──────────────
+_PATTERN_KO: dict[str, str] = {
+    'cup_and_handle': '컵앤핸들',
+    'double_bottom':  '쌍바닥',
+    'box':            '박스권 돌파',
+    'ma300_breakout': '300일선 돌파시도',
+    'ma_convergence': '5·10·20 수렴',
+    'first_pullback': '첫 눌림목',
+    'new_high':       '전고점 돌파',
+    'golden_cross':   '골든크로스',
+}
+
+
+def _bottom_progress(bs: dict) -> float:
+    pct = bs.get('breakout_pct', 0.0) or 0.0
+    if bs.get('phase') == 'FORMING':          # 레벨 아래 — 가까울수록 진행률↑ (20~70%)
+        gap = min(abs(pct), 0.10)
+        return round(20 + (1 - gap / 0.10) * 50)
+    if bs.get('phase') == 'BREAKOUT':         # 돌파 직후 — 70~100%
+        return round(70 + min(max(pct, 0.0) / 0.05, 1.0) * 30)
+    return 0.0
+
+
+def pattern_progress(patterns: dict) -> tuple[str, float, str]:
+    """대표 패턴명·진행률(0~100)·국면 라벨을 반환한다(메인 스캐너 카드 표시용).
+
+    바닥탈출 셋업(형성/돌파)이 우선, 없으면 가중치 높은 정규 패턴의 신뢰도를 진행률로.
+    반환: (pattern_ko, progress_pct, phase_ko)
+    """
+    bs = patterns.get('bottom_setup')
+    if isinstance(bs, dict) and bs.get('qualifies'):
+        pat   = _PATTERN_KO.get(bs.get('pattern'), '바닥 패턴')
+        prog  = _bottom_progress(bs)
+        phase = '형성 중' if bs.get('phase') == 'FORMING' else '돌파 직후'
+        return pat, prog, phase
+    order = ['ma300_breakout', 'first_pullback', 'ma_convergence',
+             'new_high', 'golden_cross', 'cup_and_handle', 'double_bottom']
+    for k in order:
+        v = patterns.get(k)
+        if isinstance(v, (tuple, list)) and len(v) == 3 and v[0]:
+            return _PATTERN_KO.get(k, k), round(min(float(v[1]), 1.0) * 100), '진행 중'
+    return '—', 0.0, '관망'
 
 
 def build_research_view(data: dict, scored: dict) -> dict:
@@ -451,23 +560,37 @@ def build_research_view(data: dict, scored: dict) -> dict:
     if not math.isfinite(rr):   # NaN/inf 방어 — 잘못된 입력이 적극매수로 둔갑하지 않게
         rr = 0.0
 
-    # 최종판단(액션)은 손익비(R/R)만으로 결정 — 전략 분류와 분리.
-    action = _decide_action(rr)
-    # 진입 타이밍 — 현재가가 진입구간 상단보다 얼마나 위인지(매수 계열 표시에 반영).
-    entry_timing = _entry_timing(price, entry_high)
+    # ── 추세 품질 진단 (스펙 4·5) ───────────────────────────────────────────────
+    slopes               = compute_ma_slopes(hist)
+    dead_cross           = detect_dead_cross(hist)
+    vol_label, vol_ratio = volume_state(hist)
+
+    # 실적 급락 + 이평선 하락 + 데드크로스 → 매수 금지(투자의견 회피로 강등).
+    buy_blocked = earnings_reaction_guard(hist)
+    if buy_blocked:
+        rating = 'AVOID'
+
+    # 최종판단(액션)은 단 하나의 결정 — 투자의견(매수 자격) + 진입구간 위치를 결합.
+    action = _decide_action(rating, price, entry_high, buy_blocked)
 
     return {
         'stage':        stage,
         'rating':       rating,
         'action':       action,
-        'entry_timing': entry_timing,
         'probability':  score,
+        'price':        price,
         'entry_low':    entry_low,
         'entry_high':   entry_high,
         'stop_loss':   stop_loss,
         'stop_basis':  scored.get('stop_basis'),
         'targets':     targets,
         'risk_reward': rr,
+        # 추세 품질 진단 필드 (상세분석/스캐너 카드 표시 + 매수 가드)
+        'ma_slopes':    slopes,
+        'dead_cross':   dead_cross,
+        'vol_state':    vol_label,
+        'vol_ratio':    vol_ratio,
+        'buy_blocked':  buy_blocked,
     }
 
 
@@ -517,37 +640,42 @@ def classify_strong_patterns(item: dict) -> list[str]:
         except Exception:
             pass
     patterns = item.get('patterns', {})
-    if _pat_det(patterns, 'ma10_pullback') or _pat_det(patterns, 'ma20_pullback'):
+    if _pat_det(patterns, 'first_pullback'):
         out.append('first_pullback')
     return out
 
 
 def classify_strategies(item: dict, research: dict | None = None) -> list[str]:
-    """종목을 0개 이상의 전략(선매집/바닥탈출/강세추세)으로 분류한다.
+    """종목의 '현재 지배적(dominant) 단계' 하나만 반환한다(없으면 빈 리스트).
 
-    한 종목이 여러 전략에 동시에 해당할 수 있다(예: 정배열 + 첫 눌림목).
+    라이프사이클은 선매집 → 바닥탈출 → 강세추세 순으로 진행되며, 한 종목은 자신이
+    충족하는 가장 앞선(가장 상승한) 단계 **하나**로만 분류된다.
+    우선순위: ③ 강세추세 > ② 바닥탈출 > ① 선매집.
+
+    따라서 이미 상승해 강세추세 조건(정배열·신고가·첫 눌림목·골든크로스·돌파 진행)을
+    충족한 종목은 바닥탈출(형성/돌파)을 동시에 달지 않는다 — 강세추세가 지배 단계가 된다.
+    반환 타입은 호환을 위해 list 이지만 원소는 최대 1개다.
     """
     patterns = item.get('patterns', {})
     bs = patterns.get('bottom_setup')
     bs = bs if isinstance(bs, dict) else {}
-    out: list[str] = []
-
-    # ① 선매집 — 300일선 ±5% 근접(거래량 증가·추세 전환 초기 동반 시 강화)
-    if item.get('ma300_near', False):
-        out.append('PREBUY')
-
-    # ② 바닥탈출 — 패턴 형성 중(1순위) 또는 돌파 직후 5% 이내(2순위)만.
-    #    돌파 후 5% 초과·상승 상당 진행 종목은 바닥탈출이 아니라 강세추세로 분류.
-    if bs.get('qualifies', False):
-        out.append('BOTTOM_OUT')
 
     # ③ 강세추세 — 정배열 / 신고가 / 첫 눌림목 / 골든크로스 / 바닥 패턴 돌파 진행(5%↑)
-    if (item.get('ma_aligned', False) or item.get('ma300_aligned', False)
-            or _pat_det(patterns, 'new_high')
-            or _pat_det(patterns, 'ma10_pullback')
-            or _pat_det(patterns, 'ma20_pullback')
-            or _pat_det(patterns, 'golden_cross')
-            or bs.get('extended', False)):
-        out.append('STRONG')
+    is_strong = (item.get('ma_aligned', False) or item.get('ma300_aligned', False)
+                 or _pat_det(patterns, 'new_high')
+                 or _pat_det(patterns, 'first_pullback')
+                 or _pat_det(patterns, 'golden_cross')
+                 or bs.get('extended', False))
+    # ② 바닥탈출 — 패턴 형성 중(1순위) 또는 돌파 직후 5% 이내(2순위)만.
+    is_bottom = bs.get('qualifies', False)
+    # ① 선매집 — 300일선 ±5% 근접(거래량 증가·추세 전환 초기 동반 시 강화)
+    is_prebuy = item.get('ma300_near', False)
 
-    return out
+    # 가장 앞선 단계 하나만 — 강세추세가 바닥탈출/선매집을 덮어쓴다.
+    if is_strong:
+        return ['STRONG']
+    if is_bottom:
+        return ['BOTTOM_OUT']
+    if is_prebuy:
+        return ['PREBUY']
+    return []

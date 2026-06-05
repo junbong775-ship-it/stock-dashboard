@@ -1,6 +1,4 @@
 import streamlit as st
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
 import pandas as pd
 import time
 import math
@@ -14,175 +12,46 @@ from data_provider import (
     fetch_kospi_tickers, fetch_kosdaq_tickers,
     get_kr_meta_dict, get_kr_yf_industry,
 )
-from indicators import add_indicators, calc_macd
+from indicators import add_indicators
 from ai_engine import (
     calculate_ai_score, build_research_view,
     classify_strategies, STRATEGY_META,
     classify_strong_patterns, STRONG_PATTERN_META,
-    action_view,
-    GRADE_COLOR, STAGE_META, RATING_META, ACTION_META,
+    action_view, pattern_progress,
+    GRADE_COLOR, STAGE_META,
 )
 from themes import classify_themes, theme_display, THEME_LABELS
 import news_sentiment as _sent
 import datetime as _dt
+from news_view import render_news_section
 
 
-def _fmt_news_date(published, now=None) -> str:
-    """Format a tz-aware publish datetime as 'YYYY-MM-DD HH:MM (KST) · N전'."""
-    if published is None:
-        return ''
-    if published.tzinfo is None:
-        published = published.replace(tzinfo=_dt.timezone.utc)
-    kst  = published.astimezone(_dt.timezone(_dt.timedelta(hours=9)))
-    now  = now or _dt.datetime.now(_dt.timezone.utc)
-    secs = (now - published).total_seconds()
-    if secs < 3600:
-        rel = f"{max(1, int(secs // 60))}분 전"
-    elif secs < 86400:
-        rel = f"{int(secs // 3600)}시간 전"
-    else:
-        rel = f"{int(secs // 86400)}일 전"
-    return f"{kst:%Y-%m-%d %H:%M} · {rel}"
+def naver_url(code: str, market: str) -> str:
+    """종목 → 네이버 금융 링크. 한국: 네이버증권 종목, 미국: 네이버 해외주식.
+
+    미국 종목은 거래소 접미사(.O=NASDAQ 기본)를 알 수 없는 경우가 있어 .O 로 두며,
+    NYSE 등 일부 종목은 페이지가 다를 수 있다(상세분석 탭은 거래소를 조회해 보정).
+    """
+    code = str(code or '').strip()
+    if market == 'kr':
+        digits = ''.join(ch for ch in code if ch.isdigit())
+        return f"https://finance.naver.com/item/main.naver?code={digits or code}"
+    return f"https://m.stock.naver.com/worldstock/stock/{code.upper()}.O/total"
 
 
-def _render_news_card(n_item: dict) -> None:
-    """Render one news article as a sentiment-colored card (escaped HTML)."""
-    title = n_item.get('translated') or n_item.get('original', '')
-    if not title:
-        return
-    url        = str(n_item.get('url', '') or '')
-    s_emoji, s_label, color = _sent.label_badge(n_item.get('sentiment', 'neutral'))
-    date_str   = _fmt_news_date(n_item.get('published'))
-    safe_title = _html.escape(str(title))
-    safe_date  = _html.escape(date_str)
-    safe_url   = _html.escape(url, quote=True) if url.startswith(('http://', 'https://')) else ''
-    title_html = (
-        f'<a href="{safe_url}" target="_blank" rel="noopener noreferrer" '
-        f'style="color:#DCE3F0;text-decoration:none;">{safe_title}</a>'
-        if safe_url else f'<span style="color:#DCE3F0;">{safe_title}</span>'
-    )
-    st.markdown(
-        f'<div style="border-left:3px solid {color};background:#1B1B2E;'
-        f'border-radius:6px;padding:8px 11px;margin:7px 0;">'
-        f'<div style="font-size:0.74rem;font-weight:700;color:{color};">'
-        f'{s_emoji} {s_label}</div>'
-        f'<div style="font-size:0.9rem;line-height:1.35;margin:3px 0;">{title_html}</div>'
-        f'<div style="font-size:0.7rem;color:#8A90A6;">📅 {safe_date}</div>'
-        f'</div>',
-        unsafe_allow_html=True,
-    )
-
-# ── 섹터 필터 키워드 매핑 ────────────────────────────────────────────────────────
-# 각 섹터 라벨 → sector/industry 필드에서 검색할 한글 키워드 목록
-_SECTOR_KEYWORDS: dict[str, list[str]] = {
-    '반도체':   ['반도체'],
-    '가전·전자': ['소비자 가전', '전기제품', '전기 제품', '가전'],
-    '전자부품':  ['전자 부품', '전자부품', '전자장비', '계측·정밀기기', '계측'],
-    '광통신':   ['광통신', '통신 장비'],
-    'AI':      ['소프트웨어', 'IT 서비스', '인터넷·플랫폼', '인터넷', '클라우드', '데이터'],
-    # 로보틱스는 업종 텍스트가 아니라 큐레이션된 티커 집합(_ROBOTICS_TICKERS)으로만
-    # 매칭한다. 키워드 fallback이 없으므로 빈 리스트로 둔다(드롭다운 라벨은 노출).
-    '로보틱스':  [],
-    # 양자컴퓨팅도 동일하게 큐레이션된 티커 집합(_QUANTUM_TICKERS)으로만 매칭한다.
-    '양자컴퓨팅': [],
-    '우주항공':  ['항공우주·방위', '항공우주', '방위', '우주', '항공'],
-    '전력':    ['전력', '유틸리티', '신재생에너지', '에너지 저장', '태양광', '에너지', '복합유틸리티'],
-    '바이오':   ['바이오', '제약', '의료기기', '헬스케어', '헬스IT', '진단·연구', '생명과학', '헬스'],
-    '자동차':   ['자동차'],
-    '금융':    ['금융', '은행', '보험', '자산운용', '자본시장', '금융지주'],
-    '리츠':    ['리츠', '부동산'],
-    '소비재':   ['소비재', '소매', '백화점', '여행', '호텔', '의류', '명품', '전문소매', '레저'],
-    '산업재':   ['산업재', '기계', '건설', '화학', '철강', '금속', '소재', '기초소재'],
-    '식품':    ['식품', '가공식품', '음료', '외식', '농화학'],
-    '통신':    ['통신 서비스', '방송', '미디어', '커뮤니케이션', '무선통신', '다각화된 통신'],
-}
-
-_SECTOR_LABELS = list(_SECTOR_KEYWORDS.keys())
-
-# ── 로보틱스 섹터 분류 ───────────────────────────────────────────────────────────
-# yfinance/FinanceDataReader 업종 분류에는 '로보틱스'가 없으므로(수술용 로봇=의료기기,
-# 산업용 로봇=산업기계 등으로 흩어짐), 큐레이션된 티커 집합으로 직접 매칭한다.
-_ROBOTICS_TICKERS: set[str] = {
-    # 미국 — 휴머노이드·서비스 로봇
-    'SERV',    # Serve Robotics
-    'RR',      # Richtech Robotics
-    'IRBT',    # iRobot
-    # 미국 — 산업용 로봇
-    'ABB',     # ABB Ltd
-    'ROK',     # Rockwell Automation
-    'TER',     # Teradyne (Universal Robots / MiR)
-    'FANUY',   # Fanuc
-    # 미국 — 물류·창고 자동화
-    'SYM',     # Symbotic
-    'ZBRA',    # Zebra Technologies
-    # 미국 — 머신비전
-    'CGNX',    # Cognex
-    'AMBA',    # Ambarella (비전 SoC)
-    'KYCCF',   # Keyence
-    # 미국 — 로봇 소프트웨어
-    'PATH',    # UiPath (RPA)
-    # 미국 — 로봇 부품·모션
-    'NOVT',    # Novanta
-    'ALNT',    # Allient (모션 컴포넌트)
-    # 미국 — 수술용 로봇
-    'ISRG',    # Intuitive Surgical
-    'STXS',    # Stereotaxis
-    'PRCT',    # PROCEPT BioRobotics
-    'GMED',    # Globus Medical
-    'ASXC',    # Asensus Surgical
-    # 미국 — 드론·자율 로봇
-    'AVAV',    # AeroVironment
-    'KTOS',    # Kratos Defense
-    'OUST',    # Ouster (라이다)
-    'LAZR',    # Luminar (라이다)
-    'RCAT',    # Red Cat (드론)
-    # 한국 — 로봇 (FinanceDataReader 6자리 코드)
-    '277810',  # 레인보우로보틱스
-    '454910',  # 두산로보틱스
-    '090360',  # 로보스타
-    '056080',  # 유진로봇
-    '108490',  # 로보티즈
-    '348340',  # 뉴로메카
-    '117730',  # 티로보틱스
-    '389500',  # 에스비비테크 (로봇 감속기·부품)
-    '090710',  # 휴림로봇
-}
-
-# ── 양자컴퓨팅 섹터 분류 ─────────────────────────────────────────────────────────
-# 양자컴퓨팅 역시 yfinance/FinanceDataReader의 단일 업종으로 분류되지 않으므로
-# 큐레이션된 티커 집합으로 직접 매칭한다(로보틱스와 동일 방식).
-_QUANTUM_TICKERS: set[str] = {
-    'IONQ',    # IonQ
-    'RGTI',    # Rigetti Computing
-    'QBTS',    # D-Wave Quantum
-    'QUBT',    # Quantum Computing Inc.
-    'ARQQ',    # Arqit Quantum
-    'LAES',    # SEALSQ (포스트 양자 보안)
-    'QMCO',    # Quantum Corp.
-}
+# ── 금융 섹터 제외 ───────────────────────────────────────────────────────────────
+# 은행·보험·증권·카드·금융서비스 종목은 스캐너 결과에서 자동 제외한다(섹터/업종 텍스트 매칭).
+# 미국은 sector='금융'(Financial Services)으로 일괄 잡히고, 세부 업종(지방은행/생명보험/
+# 자본시장 등)·한국 업종 텍스트는 키워드로 보강한다.
+_FINANCIAL_KEYWORDS: tuple[str, ...] = (
+    '금융', '은행', '보험', '증권', '카드', '자산운용', '자본시장',
+)
 
 
-def _match_sector_filter(item: dict, selected: list[str]) -> bool:
-    """선택된 섹터 중 하나라도 매칭되면 True (OR 로직)."""
-    if not selected:
-        return True
-    text = f"{item.get('sector', '')} {item.get('industry', '')}".lower()
-    code = str(item.get('code', '')).upper()
-    for label in selected:
-        # 로보틱스는 큐레이션된 티커 집합으로만 매칭 (키워드 fallback 없음)
-        if label == '로보틱스':
-            if code in _ROBOTICS_TICKERS:
-                return True
-            continue
-        # 양자컴퓨팅도 큐레이션된 티커 집합으로만 매칭 (키워드 fallback 없음)
-        if label == '양자컴퓨팅':
-            if code in _QUANTUM_TICKERS:
-                return True
-            continue
-        for kw in _SECTOR_KEYWORDS.get(label, []):
-            if kw.lower() in text:
-                return True
-    return False
+def _is_financial(sector: str, industry: str) -> bool:
+    """섹터/업종 텍스트가 금융권(은행·보험·증권·카드·금융서비스)이면 True."""
+    text = f"{sector or ''} {industry or ''}"
+    return any(kw in text for kw in _FINANCIAL_KEYWORDS)
 
 
 def _match_theme_filter(item: dict, selected: list[str]) -> bool:
@@ -258,92 +127,25 @@ def _match_pattern_filter(item: dict, selected: list[str]) -> bool:
     return False
 
 
-# ── Chart ──────────────────────────────────────────────────────────────────────────
-def make_chart(hist: pd.DataFrame, label: str, height: int = 480) -> go.Figure:
-    fig = make_subplots(
-        rows=2, cols=1,
-        shared_xaxes=True,
-        row_heights=[0.7, 0.3],
-        vertical_spacing=0.04,
-        subplot_titles=[label, 'MACD'],
-    )
-
-    fig.add_trace(go.Candlestick(
-        x=hist.index,
-        open=hist['Open'], high=hist['High'],
-        low=hist['Low'],   close=hist['Close'],
-        name='캔들',
-        increasing_line_color='#EF5350',
-        decreasing_line_color='#26A69A',
-        showlegend=False,
-    ), row=1, col=1)
-
-    for col_name, color, lbl in [
-        ('MA20', '#FFD700', 'MA20'),
-        ('MA60', '#FF9F40', 'MA60'),
-        ('MA120', '#9B59B6', 'MA120'),
-    ]:
-        if col_name in hist.columns:
-            fig.add_trace(go.Scatter(
-                x=hist.index, y=hist[col_name], name=lbl,
-                line=dict(color=color, width=1.5), opacity=0.85,
-            ), row=1, col=1)
-
-    macd_data   = calc_macd(hist['Close'])
-    macd_line   = macd_data['macd']
-    signal_line = macd_data['signal']
-    histogram   = macd_data['hist']
-    bar_colors  = ['#EF5350' if v >= 0 else '#26A69A' for v in histogram]
-
-    fig.add_trace(go.Bar(
-        x=hist.index, y=histogram, name='히스토그램',
-        marker_color=bar_colors, showlegend=False,
-    ), row=2, col=1)
-    fig.add_trace(go.Scatter(
-        x=hist.index, y=macd_line, name='MACD',
-        line=dict(color='#5B8DEF', width=1.5),
-    ), row=2, col=1)
-    fig.add_trace(go.Scatter(
-        x=hist.index, y=signal_line, name='시그널',
-        line=dict(color='#FF6384', width=1.5),
-    ), row=2, col=1)
-
-    fig.update_layout(
-        height=height,
-        margin=dict(l=0, r=0, t=36, b=0),
-        legend=dict(orientation='h', y=1.08, font=dict(size=11)),
-        hovermode='x unified',
-        plot_bgcolor='rgba(0,0,0,0)',
-        paper_bgcolor='rgba(0,0,0,0)',
-        xaxis_rangeslider_visible=False,
-    )
-    fig.update_yaxes(gridcolor='rgba(100,100,150,0.15)')
-    return fig
-
-
 # ── Pattern badges ─────────────────────────────────────────────────────────────────
 _PATTERN_LABELS = {
-    # 눌림목 패턴 (저위험 진입 구간)
-    'ma10_pullback':  'MA10 눌림목',
-    'ma20_pullback':  'MA20 눌림목',
-    # 단일 패턴
+    'cup_and_handle': '컵앤핸들 형성',
+    'double_bottom':  '쌍바닥 형성',
+    'ma300_breakout': '300일선 돌파 시도',
+    'ma_convergence': '5·10·20일선 수렴',
+    'first_pullback': '첫 눌림목',
     'new_high':       '신고가 돌파',
-    'volume_surge':   '거래량 급증',
     'golden_cross':   '골든크로스',
-    'cup_and_handle': '컵앤핸들',
-    'double_bottom':  '더블바텀',
-    'box_breakout':   '박스권 돌파',
 }
 
 _CARD_PATTERN_ICONS: dict[str, tuple[str, str]] = {
-    'ma10_pullback':  ('🔥', 'MA10 눌림'),
-    'ma20_pullback':  ('🔥', 'MA20 눌림'),
-    'new_high':       ('🚀', '신고가 돌파'),
-    'volume_surge':   ('📈', '거래량 급증'),
-    'golden_cross':   ('🏆', '골든크로스'),
     'cup_and_handle': ('☕', '컵앤핸들'),
-    'double_bottom':  ('🔄', '더블바텀'),
-    'box_breakout':   ('📦', '박스권 돌파'),
+    'double_bottom':  ('🔄', '쌍바닥'),
+    'ma300_breakout': ('🎯', '300일선 돌파'),
+    'ma_convergence': ('🧲', '5·10·20 수렴'),
+    'first_pullback': ('🔥', '첫 눌림목'),
+    'new_high':       ('🚀', '신고가 돌파'),
+    'golden_cross':   ('🏆', '골든크로스'),
 }
 
 
@@ -441,7 +243,6 @@ def _build_ai_summary(label: str, data: dict, scored: dict, research: dict) -> s
     score = scored['score']
     grade = scored['grade']
     stage = research['stage']
-    rating = research['rating']
     rsi = data.get('rsi', 0.0)
     mfi = data.get('mfi', 0.0)
     price = data.get('price', 0.0)
@@ -449,13 +250,12 @@ def _build_ai_summary(label: str, data: dict, scored: dict, research: dict) -> s
     patterns = scored.get('patterns', {})
 
     stage_ko, _, stage_desc = STAGE_META.get(stage, (stage, '', ''))
-    rating_ko, _, rating_cmt = RATING_META.get(rating, (rating, '', ''))
     label = _html.escape(str(label))
 
     parts: list[str] = []
     parts.append(
         f"**{label}** 은(는) 현재 **{stage_ko}** 국면으로 판단되며, "
-        f"AI 종합 점수는 **{score}/100 ({grade}등급)**, 투자의견은 **{rating_ko}** 입니다. "
+        f"AI 종합 점수는 **{score}/100 ({grade}등급)** 입니다. "
         f"{stage_desc}."
     )
 
@@ -499,13 +299,82 @@ def _build_ai_summary(label: str, data: dict, scored: dict, research: dict) -> s
     t1 = research['targets'][0]
     parts.append(
         f"권장 진입 구간은 **{el:,.2f} ~ {eh:,.2f}**, 손절가는 **{research['stop_loss']:,.2f}**, "
-        f"1차 목표가는 **{t1:,.2f}** 로 손익비는 약 **{research['risk_reward']:.1f} : 1** 입니다. {rating_cmt}."
+        f"1차 목표가는 **{t1:,.2f}** 로 손익비는 약 **{research['risk_reward']:.1f} : 1** 입니다."
     )
 
     a_ko, a_final, _ = action_view(research)
-    parts.append(f"종합 액션은 **{a_ko} → {a_final}** 으로 판단됩니다.")
+    parts.append(f"**최종 행동은 「{a_ko}」 — {a_final}** 입니다.")
 
     return "\n\n".join(parts)
+
+
+def _tech_detail_html(scored: dict, research: dict) -> str:
+    """상세분석용 기술 지표 카드 — 이평 기울기·데드크로스·거래량·손절근거·300일선 관점."""
+    slopes = research.get('ma_slopes', {}) or {}
+
+    def _slope(key):
+        lbl, pct = slopes.get(key, ('—', 0.0))
+        col = {'상승': '#00C851', '하락': '#FF5252', '횡보': '#FFB300'}.get(lbl, '#9E9E9E')
+        txt = f'{lbl} ({pct:+.2f}%)' if lbl != '—' else '—'
+        return col, txt
+
+    dead     = bool(research.get('dead_cross'))
+    dead_col = '#FF5252' if dead else '#69F0AE'
+    dead_txt = '있음 ⚠️' if dead else '없음'
+
+    vol       = research.get('vol_state', '—')
+    vol_ratio = research.get('vol_ratio', 0.0) or 0.0
+    vol_col   = {'급증': '#FF7043', '증가': '#69F0AE',
+                 '감소': '#90A4AE', '보통': '#C8C8E8'}.get(vol, '#C8C8E8')
+    vol_txt   = f'{vol} ({vol_ratio:.1f}x)' if vol and vol != '—' else '—'
+
+    basis    = research.get('stop_basis') or '—'
+    basis_ko = {'swing_low': '최근 스윙로우', 'ma20': 'MA20',
+                'atr2': 'ATR(14)×2', 'fallback': '폴백(-8%)'}.get(basis, basis)
+    stop     = research.get('stop_loss')
+    stop_txt = f'{stop:,.2f} · {basis_ko}' if isinstance(stop, (int, float)) else str(basis_ko)
+
+    dev = scored.get('ma300_dev_pct')
+    if isinstance(dev, (int, float)):
+        if dev >= 0:
+            ma300_col, ma300_txt = '#69F0AE', f'MA300 위 (+{dev:.1f}%) · 중장기 상승권'
+        else:
+            ma300_col, ma300_txt = '#FF8A80', f'MA300 아래 ({dev:.1f}%) · 회복 시도/주의'
+    else:
+        ma300_col, ma300_txt = '#9E9E9E', '—'
+
+    def _row(label, value, vcol='#D5D5EE'):
+        return (
+            f'<div style="display:flex;justify-content:space-between;gap:10px;'
+            f'padding:5px 0;border-bottom:1px solid #23233A">'
+            f'<span style="color:#8888AA;font-size:0.8rem">{_html.escape(label)}</span>'
+            f'<span style="color:{vcol};font-size:0.86rem;font-weight:600;'
+            f'text-align:right">{_html.escape(str(value))}</span></div>'
+        )
+
+    c5, t5   = _slope('ma5')
+    c10, t10 = _slope('ma10')
+    c20, t20 = _slope('ma20')
+
+    guard_row = ''
+    if research.get('buy_blocked'):
+        guard_row = _row('매수 가드', '실적 급락 + 이평 하락 + 데드크로스 → 매수 금지', '#FF5252')
+
+    return (
+        '<div style="background:#15151F;border:1px solid #2E2E4E;border-radius:12px;'
+        'padding:14px 18px;margin-bottom:14px">'
+        '<div style="font-size:0.72rem;letter-spacing:.08em;color:#8888AA;'
+        'text-transform:uppercase;margin-bottom:6px">기술 지표 상세 · Technicals</div>'
+        + _row('MA5 기울기', t5, c5)
+        + _row('MA10 기울기', t10, c10)
+        + _row('MA20 기울기', t20, c20)
+        + _row('데드크로스 여부', dead_txt, dead_col)
+        + _row('거래량 상태', vol_txt, vol_col)
+        + _row('손절 근거', stop_txt, '#FF8A80')
+        + _row('300일선 관점', ma300_txt, ma300_col)
+        + guard_row
+        + '</div>'
+    )
 
 
 def render_full_detail(label: str, data: dict) -> None:
@@ -522,20 +391,14 @@ def render_full_detail(label: str, data: dict) -> None:
     patterns  = scored.get('patterns', {})
 
     price      = data.get('price', 0)
-    change     = data.get('change_pct', 0)
-    market     = data.get('market', 'us')
-    hist       = data.get('hist')
     news       = data.get('news', [])
 
-    rating  = research['rating']
     stage   = research['stage']
-    action  = research.get('action', 'WATCH')
     el, eh  = research['entry_low'], research['entry_high']
     stop    = research['stop_loss']
     t1, t2, t3 = research['targets']
     rr      = research['risk_reward']
 
-    r_ko, r_col, r_cmt = RATING_META.get(rating, (rating, '#9E9E9E', ''))
     s_ko, s_col, s_desc = STAGE_META.get(stage, (stage, '#9E9E9E', ''))
     a_ko, a_final, a_col = action_view(research)
     p_col   = _prob_color(score)
@@ -543,21 +406,14 @@ def render_full_detail(label: str, data: dict) -> None:
     def pct(v):
         return (v - price) / price * 100 if price else 0.0
 
-    # ── 1) 액션 / 투자의견 / 국면 / AI 상승확률 ───────────────────────────────
+    # ── 1) 최종 행동(단일 결정) / 국면 / AI 상승확률 ──────────────────────────
     st.markdown(f"""
 <div style="display:flex;flex-wrap:wrap;gap:12px;margin-bottom:14px">
-  <div style="flex:1 1 180px;background:#16161F;border:1px solid {a_col}55;
+  <div style="flex:1 1 240px;background:#16161F;border:1px solid {a_col}55;
               border-left:4px solid {a_col};border-radius:12px;padding:14px 18px">
-    <div style="font-size:0.72rem;letter-spacing:.08em;color:#8888AA;text-transform:uppercase">액션 · Action</div>
+    <div style="font-size:0.72rem;letter-spacing:.08em;color:#8888AA;text-transform:uppercase">최종 행동 · Final Action</div>
     <div style="font-size:1.7rem;font-weight:800;color:{a_col};margin-top:2px">{a_ko}</div>
-    <div style="font-size:0.85rem;font-weight:700;color:{a_col};margin-top:2px">최종판단: {a_final}</div>
-  </div>
-  <div style="flex:1 1 180px;background:#16161F;border:1px solid {r_col}55;
-              border-left:4px solid {r_col};border-radius:12px;padding:14px 18px">
-    <div style="font-size:0.72rem;letter-spacing:.08em;color:#8888AA;text-transform:uppercase">투자의견 · Rating</div>
-    <div style="font-size:1.7rem;font-weight:800;color:{r_col};margin-top:2px">{r_ko}
-      <span style="font-size:0.9rem;font-weight:600;color:{r_col}AA">{rating}</span></div>
-    <div style="font-size:0.78rem;color:#9999BB;margin-top:2px">{r_cmt}</div>
+    <div style="font-size:0.85rem;font-weight:700;color:{a_col};margin-top:2px">{a_final}</div>
   </div>
   <div style="flex:1 1 180px;background:#16161F;border:1px solid {s_col}55;
               border-left:4px solid {s_col};border-radius:12px;padding:14px 18px">
@@ -628,6 +484,13 @@ def render_full_detail(label: str, data: dict) -> None:
         unsafe_allow_html=True,
     )
 
+    # ── 2-b) 기술 지표 상세 (이평 기울기 · 데드크로스 · 거래량 · 손절근거 · 300일선) ──
+    try:
+        st.markdown("##### 🔬 기술 지표 상세")
+        st.markdown(_tech_detail_html(scored, research), unsafe_allow_html=True)
+    except Exception:
+        pass
+
     # ── 3) AI 상세 코멘트 ──────────────────────────────────────────────────────
     try:
         st.markdown("##### 🧠 AI 상세 분석")
@@ -647,39 +510,11 @@ def render_full_detail(label: str, data: dict) -> None:
     except Exception:
         pass
 
-    # ── 5) 차트 (접이식) ───────────────────────────────────────────────────────
-    if hist is not None:
-        price_str  = f"{price:,.0f}원" if market == 'kr' else f"${price:,.2f}"
-        change_str = f"+{change:.1f}%" if change >= 0 else f"{change:.1f}%"
-        with st.expander(f"📈 차트 보기 ({price_str} / {change_str})", expanded=False):
-            try:
-                st.plotly_chart(make_chart(hist, label, height=360), width='stretch')
-            except Exception:
-                st.caption("차트를 표시할 수 없습니다.")
-
-    # ── 6) 뉴스 ────────────────────────────────────────────────────────────────
+    # ── 5) 뉴스 ────────────────────────────────────────────────────────────────
+    # 내장 차트 섹션은 제거됨: 종목명이 네이버 차트로 바로 연결되므로 중복이며,
+    # 화면을 많이 차지하고 렌더링을 느리게 했다.
     with st.expander("📰 최신 뉴스 (최근 3일)", expanded=False):
-        if news:
-            o_score          = _sent.overall_score(news)
-            o_emoji, o_label = _sent.overall_label(o_score)
-            o_color          = _sent.overall_color(o_score)
-            st.markdown(
-                f'<div style="background:{o_color}22;border:1px solid {o_color}66;'
-                f'border-radius:8px;padding:9px 12px;margin-bottom:6px;'
-                f'display:flex;align-items:center;justify-content:space-between;gap:8px;">'
-                f'<span style="font-size:0.82rem;color:#B8C0D6;">종합 뉴스 감성</span>'
-                f'<span style="font-size:0.95rem;font-weight:700;color:{o_color};">'
-                f'{o_emoji} {o_label} ({o_score}/100)</span>'
-                f'</div>',
-                unsafe_allow_html=True,
-            )
-            for n_item in news:
-                try:
-                    _render_news_card(n_item)
-                except Exception:
-                    pass
-        else:
-            st.caption("최근 3일 내 관련 뉴스 없음")
+        render_news_section(news, key_prefix="an")
 
 
 # ══════════════════════════════════════════════════════════════════════════════════
@@ -761,6 +596,7 @@ def render_analysis_tab() -> None:
 
     company_name = _html.escape(str(company_name))
     code_disp    = _html.escape(str(code))
+    n_url        = _html.escape(naver_url(code, market))
 
     st.markdown(f"""
 <div style="background:#1E1E2E;border:1px solid #2E2E4E;border-radius:14px;
@@ -768,7 +604,9 @@ def render_analysis_tab() -> None:
   <div style="display:flex;justify-content:space-between;align-items:flex-start;">
     <div>
       <div style="font-size:1.4rem;font-weight:700;color:#E0E0FF">
-        {company_name} <span style="color:#8888AA;font-weight:400;font-size:1.1rem">({code_disp})</span>
+        <a href="{n_url}" target="_blank" rel="noopener"
+           style="color:#E0E0FF;text-decoration:none;border-bottom:1px dotted #6C6C9C">{company_name}</a>
+        <span style="color:#8888AA;font-weight:400;font-size:1.1rem">({code_disp})</span>
       </div>
       {industry_theme_block}
     </div>
@@ -944,24 +782,26 @@ def _ma_last(item: dict, col: str):
 def _action_reason(research: dict) -> tuple[str, str]:
     """(action 결정 사유, 제외 사유) 를 반환한다.
 
-    최종판단(액션)은 오직 손익비(R/R)로만 결정된다(`ai_engine._decide_action`).
-    따라서 카드에 액션='제외'가 찍히는 경우는 단 하나 — R/R < 1.0 (RR_FILTER) 뿐이다.
-    (ETF/SPAC/거래대금/연구뷰실패 컷은 스캐너 단계에서 결과에서 아예 제거되므로
-     카드로 렌더링되지 않는다.)
+    최종판단(액션)은 단 하나의 결정 — 투자의견(매수 자격) + 진입구간 위치로 산출된다
+    (`ai_engine._decide_action`).
+      매수 + 진입구간 도달 → 바로 진입 · 근처 → 분할 진입 · 위 → 관찰리스트 ·
+      조건 미충족(매수의견 아님/매수 차단) → 제외
     """
-    rr = research.get('risk_reward', 0.0) or 0.0
-    if not math.isfinite(rr):   # NaN/inf 방어 — 잘못된 입력이 매수로 둔갑하지 않게
-        rr = 0.0
-    action = research.get('action', 'WATCH')
-    if action == 'EXCLUDE' or rr < 1.0:
-        return f'R/R {rr:.2f} < 1.0 → 제외', 'RR_FILTER'
-    if rr < 2.0:
-        return f'1.0 ≤ R/R {rr:.2f} < 2.0 → 관망', 'NONE'
-    if rr < 3.0:
-        return f'2.0 ≤ R/R {rr:.2f} < 3.0 → 선매집', 'NONE'
-    if rr < 5.0:
-        return f'3.0 ≤ R/R {rr:.2f} < 5.0 → 매수', 'NONE'
-    return f'R/R {rr:.2f} ≥ 5.0 → 적극매수', 'NONE'
+    action = research.get('action', 'EXCLUDE')
+    rating = research.get('rating', '')
+    price  = research.get('price') or 0.0
+    eh     = research.get('entry_high') or 0.0
+    gap    = ((price - eh) / eh * 100) if eh else 0.0
+
+    if research.get('buy_blocked'):
+        return '실적 급락 + 이평 하락 + 데드크로스 → 매수 금지', 'EARNINGS_GUARD'
+    if action == 'EXCLUDE':
+        return f'투자의견 {rating} (매수 아님) → 제외', 'NOT_BUY'
+    if action == 'ENTER':
+        return f'매수 + 진입구간 도달 (상단 대비 {gap:+.1f}%) → 바로 진입', 'NONE'
+    if action == 'SPLIT':
+        return f'매수 + 진입구간 근처 (상단 대비 {gap:+.1f}%) → 분할 진입', 'NONE'
+    return f'매수 + 진입구간 위 (상단 대비 {gap:+.1f}%) → 관찰리스트', 'NONE'
 
 
 def _debug_block_html(item: dict, research: dict) -> str:
@@ -1021,8 +861,8 @@ def _debug_block_html(item: dict, research: dict) -> str:
 def _render_scanner_card(item: dict, research: dict | None, tags: list[str]) -> None:
     """스캐너 결과 카드 한 개를 렌더링한다.
 
-    필드 순서: 전략 → 패턴 → 업종 → 테마 → 액션 → 확률점수 →
-    매수구간 → 손절가 → 목표가 → 손익비 → 최종판단.
+    필드 순서: 전략 → 패턴 → 업종 → 테마 → 현재 국면 → 거래량 상태 →
+    확률점수 → 매수구간 → 손절가 → 목표가 → 손익비 → 최종 행동(단일 결정).
     """
     code   = item.get('code', '')
     name   = item.get('name', '')
@@ -1052,6 +892,7 @@ def _render_scanner_card(item: dict, research: dict | None, tags: list[str]) -> 
     chg_color  = "#00C851" if change >= 0 else "#FF5252"
     name_disp  = _html.escape(str(name))
     code_disp  = _html.escape(str(code))
+    n_url      = _html.escape(naver_url(code, item.get('market', '')))
 
     # 전략 칩 (바닥탈출은 형성/돌파 국면 라벨을 함께 표기)
     _bs = patterns.get('bottom_setup') if isinstance(patterns, dict) else None
@@ -1115,6 +956,22 @@ def _render_scanner_card(item: dict, research: dict | None, tags: list[str]) -> 
     action = research.get('action', 'WATCH')
     a_ko, a_final, a_col = action_view(research)
 
+    # 패턴 진행률 / 현재 국면 / 거래량 상태 (스펙 1·4)
+    pp_name, pp_pct, pp_phase = pattern_progress(patterns)
+    pp_html = (
+        f'{_html.escape(pp_name)} · {pp_pct:.0f}% '
+        f'<span style="color:#8888AA;font-weight:400">({_html.escape(pp_phase)})</span>'
+        if pp_name != '—' else '<span style="color:#666">—</span>'
+    )
+    stage_code = research.get('stage', '')
+    s_ko, s_col, _s_desc = STAGE_META.get(stage_code, (stage_code or '—', '#9E9E9E', ''))
+    vol_state = research.get('vol_state', '—')
+    vol_ratio = research.get('vol_ratio', 0.0) or 0.0
+    vol_str = (f'{_html.escape(str(vol_state))} ({vol_ratio:.1f}x)'
+               if vol_state and vol_state != '—' else '—')
+    vol_col = {'급증': '#FF7043', '증가': '#69F0AE',
+               '감소': '#90A4AE', '보통': '#C8C8E8'}.get(vol_state, '#C8C8E8')
+
     # 매매 플랜
     el = research.get('entry_low'); eh = research.get('entry_high')
     stop = research.get('stop_loss')
@@ -1148,7 +1005,9 @@ def _render_scanner_card(item: dict, research: dict | None, tags: list[str]) -> 
             padding:14px 16px 10px;margin-bottom:4px;">
   <div style="display:flex;justify-content:space-between;align-items:center;">
     <span style="font-size:1.02rem;font-weight:700;color:#E0E0FF">
-      {name_disp} <span style="color:#8888AA;font-weight:400;font-size:0.85rem">({code_disp})</span>
+      <a href="{n_url}" target="_blank" rel="noopener"
+         style="color:#E0E0FF;text-decoration:none;border-bottom:1px dotted #6C6C9C">{name_disp}</a>
+      <span style="color:#8888AA;font-weight:400;font-size:0.85rem">({code_disp})</span>
     </span>
     <span style="background:{badge_col};color:#000;font-weight:700;
                  padding:2px 10px;border-radius:10px;font-size:0.8rem">{grade}</span>
@@ -1160,19 +1019,23 @@ def _render_scanner_card(item: dict, research: dict | None, tags: list[str]) -> 
   {_row("전략", strat_html)}
   {_row("강세패턴", strong_html) if strong_html else ""}
   {_row("패턴", pat_html)}
+  {_row("패턴 진행률", pp_html)}
   {_row("업종", industry_disp)}
   {_row("테마", theme_html)}
   {_row("MA300 이격도", dev_str, "#FFD54F")}
   {_row("MA300 전략", ma300_yn, yn_col)}
-  {_row("액션", a_ko, a_col)}
+  {_row("현재 국면", s_ko, s_col)}
+  {_row("거래량 상태", vol_str, vol_col)}
   {_row("확률점수", f'{score}/100', p_col)}
   {_row("매수구간", entry_str, "#64B5F6")}
   {_row("손절가", _f(stop), "#FF8A80")}
   {_row("목표가", _f(t1), "#69F0AE")}
   {_row("손익비(R/R)", f'{rr:.1f} : 1', "#B388FF")}
-  <div style="display:flex;justify-content:space-between;gap:10px;padding:6px 0 2px">
-    <span style="color:#8888AA;font-size:0.74rem">최종판단</span>
-    <span style="color:{a_col};font-size:0.9rem;font-weight:800">{a_final}</span>
+  <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;
+              margin-top:8px;padding:8px 10px;background:{a_col}1A;
+              border:1px solid {a_col}55;border-radius:8px">
+    <span style="color:#A0A0C0;font-size:0.74rem;font-weight:600">최종 행동</span>
+    <span style="color:{a_col};font-size:1.0rem;font-weight:800">{a_ko}</span>
   </div>
   <div style="display:flex;gap:14px;margin-top:8px;flex-wrap:wrap;">
     <span style="font-size:0.72rem;color:#8888AA">밀집도 <b style="color:#C8C8E8">{spread:.2f}%</b></span>
@@ -1197,23 +1060,7 @@ def _render_scanner_card(item: dict, research: dict | None, tags: list[str]) -> 
                 debug_lines.append(f"{icon} {k}: detected={det}, conf={conf:.2f}, desc={desc!r}")
             st.code("\n".join(debug_lines), language=None)
         st.markdown("**📰 최신 뉴스 (최근 3일)**")
-        if news:
-            o_score          = _sent.overall_score(news)
-            o_emoji, o_label = _sent.overall_label(o_score)
-            o_color          = _sent.overall_color(o_score)
-            st.markdown(
-                f'<div style="font-size:0.82rem;font-weight:700;'
-                f'color:{o_color};margin-bottom:4px;">'
-                f'{o_emoji} 종합 감성 {o_label} ({o_score}/100)</div>',
-                unsafe_allow_html=True,
-            )
-            for n_item in news:
-                try:
-                    _render_news_card(n_item)
-                except Exception:
-                    pass
-        else:
-            st.caption("최근 3일 내 관련 뉴스 없음")
+        render_news_section(news, key_prefix="sc")
 
 
 def _render_results_grid(enriched: list[tuple]) -> None:
@@ -1253,8 +1100,6 @@ def render_scanner_tab() -> None:
 
     # ── 결과 필터 session_state 사전 초기화 ─────────────────────────────────
     # 위젯 렌더링 전에 초기화해야 default= 와 session_state 충돌이 없음
-    if "sector_multisel" not in st.session_state:
-        st.session_state["sector_multisel"] = []
     if "grade_multisel" not in st.session_state:
         st.session_state["grade_multisel"] = []
     if "pattern_multisel" not in st.session_state:
@@ -1280,13 +1125,6 @@ def render_scanner_tab() -> None:
         st.markdown("### 🎯 결과 필터")
         st.caption("스캔 완료 후 결과를 즉시 좁혀볼 수 있습니다.")
 
-        sector_sel: list[str] = st.multiselect(
-            "섹터",
-            options=_SECTOR_LABELS,
-            key="sector_multisel",
-            placeholder="전체 섹터",
-        )
-
         theme_sel: list[str] = st.multiselect(
             "테마",
             options=THEME_LABELS,
@@ -1310,12 +1148,11 @@ def render_scanner_tab() -> None:
         )
 
         def _reset_filters() -> None:
-            st.session_state["sector_multisel"]  = []
             st.session_state["theme_multisel"]   = []
             st.session_state["grade_multisel"]   = []
             st.session_state["pattern_multisel"] = []
 
-        _has_active = (bool(sector_sel) or bool(theme_sel)
+        _has_active = (bool(theme_sel)
                        or bool(grade_sel) or bool(pattern_sel))
         st.button(
             "🔁 필터 초기화",
@@ -1383,7 +1220,7 @@ def render_scanner_tab() -> None:
         spac_excluded:      int = 0
         null_count:         int = 0   # 데이터 없음(None) 종목
         liquidity_excluded: int = 0   # 거래대금 100억원 미만
-        rr_excluded:        int = 0   # 손익비(R/R) 1 미만 제외
+        financial_excluded: int = 0   # 금융권(은행·보험·증권·카드·금융서비스) 제외
 
         _MIN_DAILY_VALUE_KRW = 10_000_000_000   # 100억원
         _KRW_PER_USD         = 1_350             # USD→KRW 환산 기준
@@ -1392,17 +1229,63 @@ def render_scanner_tab() -> None:
             code, name, mkt = item
             return code, name, mkt, get_data(code, mkt)
 
+        # 스캐너 멈춤 방지 워치독: 워커가 네트워크 호출(yfinance .info / 번역 등)에서
+        # 무기한 블로킹되면 future 가 완료되지 않아 기존 as_completed 가 끝까지 대기 →
+        # 4136/4146 부근에서 영구 정지했다. 진척이 멈추면(스톨) 막힌 잔여 종목을 건너뛰어
+        # 어떤 종목이 막혀도 스캔이 항상 종료되도록 보장한다.
+        STALL_SKIP_SEC   = 3.0    # 막판 3초간 완료 0건 → 잔여(막힌) 종목 스킵
+        GLOBAL_STALL_SEC = 20.0   # 대량 정지(네트워크 장애 등) 대비 전역 백스톱
+        TAIL_PENDING     = 60     # 잔여가 이 이하일 때 3초 워치독 가동
+
+        exc = None
+        last_ticker = '—'
         try:
-            with ThreadPoolExecutor(max_workers=20) as exc:
-                futures = {exc.submit(_dl, item): item for item in scan_list}
-                for fut in as_completed(futures):
+            exc = ThreadPoolExecutor(max_workers=20)
+            futures = {exc.submit(_dl, item): item for item in scan_list}
+            pending = set(futures)
+            last_completion = time.time()
+            while pending:
+                done_now = [f for f in pending if f.done()]
+                if not done_now:
+                    # 한 건도 완료되지 않음 → 스톨 워치독 검사
+                    stalled = time.time() - last_completion
+                    if pending and (
+                        (len(pending) <= TAIL_PENDING and stalled > STALL_SKIP_SEC)
+                        or stalled > GLOBAL_STALL_SEC
+                    ):
+                        stuck  = [futures[f] for f in pending]
+                        labels = ', '.join(
+                            f"{(it[1] or it[0])}({it[0]}/{it[2]})" for it in stuck[:10])
+                        print(
+                            f"[scanner] STALL {stalled:.1f}s — last_processed='{last_ticker}'; "
+                            f"skipping {len(stuck)} stuck ticker(s): {labels}"
+                            f"{' …' if len(stuck) > 10 else ''}",
+                            flush=True,
+                        )
+                        for f in pending:
+                            f.cancel()
+                        completed  += len(stuck)
+                        null_count += len(stuck)
+                        pending.clear()
+                        break
+                    time.sleep(0.05)
+                    continue
+
+                last_completion = time.time()
+                for fut in done_now:
+                    pending.discard(fut)
+                    _item = futures[fut]
+                    last_ticker = f"{(_item[1] or _item[0])}({_item[0]}/{_item[2]})"
                     completed += 1
+                    if completed % 500 == 0:
+                        print(f"[scanner] …{completed}/{total} last='{last_ticker}'",
+                              flush=True)
                     code = name = mkt = ''
                     raw: dict | None = None
 
-                    # ① future 결과 수거 — 예외 독립 처리
+                    # ① future 결과 수거 — 예외 독립 처리 (한 종목 실패가 전체를 막지 않음)
                     try:
-                        code, name, mkt, raw = fut.result()
+                        code, name, mkt, raw = fut.result(timeout=0)
                     except Exception:
                         pass   # raw stays None → counted as null below
 
@@ -1468,8 +1351,20 @@ def render_scanner_tab() -> None:
                         pass
         except Exception as e:
             stat_box.error(f"1단계 오류: {e}")
-            prog_bar.empty()
+            try:
+                prog_bar.empty()
+            except Exception:
+                pass
             return
+        finally:
+            # 멈춘 워커가 있어도 셧다운에서 대기하지 않음 → with 블록 hang 방지.
+            if exc is not None:
+                exc.shutdown(wait=False, cancel_futures=True)
+        print(
+            f"[scanner] Stage1 완료: {completed}/{total} 처리 · 통과 {len(stage1_ok)} · "
+            f"데이터없음 {null_count} · last_processed='{last_ticker}'",
+            flush=True,
+        )
 
         # ── Stage 2: full indicators + AI score on survivors only ──────
         results: list[dict] = []
@@ -1499,6 +1394,10 @@ def render_scanner_tab() -> None:
                 if mkt == 'kr' and not data.get('industry'):
                     _ind = get_kr_yf_industry(code, _m.get('market', ''))
                     data = {**data, 'industry': _ind}
+                # 금융권(은행·보험·증권·카드·금융서비스) 제외
+                if _is_financial(data.get('sector', ''), data.get('industry', '')):
+                    financial_excluded += 1
+                    continue
                 # 거래대금 계산 (카드 표시용, 5일 평균)
                 try:
                     _hist_tv = raw.get('hist')
@@ -1519,16 +1418,11 @@ def render_scanner_tab() -> None:
                     'trading_value':  _tv_raw,   # 로컬 통화 (KRW or USD)
                     **data, **scored,
                 }
-                # 손익비(R/R) 1 미만 → 제외 (전략 분류와 무관하게 최종판단 규칙으로 컷).
-                # 연구뷰 계산이 실패하면 R/R 을 확정할 수 없으므로 fail-closed 로 제외한다.
+                # 연구뷰(R/R 등) 계산. R/R<1 도 제외하지 않고 관찰리스트로 결과에 포함한다.
+                # 연구뷰 계산 자체가 실패하면 액션을 확정할 수 없으므로 fail-closed 로 제외.
                 try:
                     _rv = build_research_view(item, item)
                 except Exception:
-                    rr_excluded += 1
-                    continue
-                _rr_val = _rv.get('risk_reward', 0.0) or 0.0
-                if not (_rr_val >= 1.0):   # NaN 도 함께 제외 (NaN>=1 → False)
-                    rr_excluded += 1
                     continue
                 item['_research'] = _rv
                 results.append(item)
@@ -1542,7 +1436,7 @@ def render_scanner_tab() -> None:
             'total': total, 'elapsed': total_elapsed, 'rate': avg_rate,
             'etf_excluded': etf_excluded, 'spac_excluded': spac_excluded,
             'liquidity_excluded': liquidity_excluded,
-            'rr_excluded': rr_excluded,
+            'financial_excluded': financial_excluded,
             'null_count': null_count,
             'stage1_pass': len(stage1_ok), 'stage2_pass': len(results),
             'with_patterns': with_patterns,
@@ -1552,8 +1446,8 @@ def render_scanner_tab() -> None:
             stat_box.success(
                 f"✅ 스캔 완료 &nbsp;·&nbsp; **{total:,}종목 / {total_elapsed:.1f}초** "
                 f"&nbsp;·&nbsp; ETF제외 **{etf_excluded}** · SPAC제외 **{spac_excluded}** "
-                f"· 거래대금제외 **{liquidity_excluded}** · 데이터없음 **{null_count}** "
-                f"· R/R<1 제외 **{rr_excluded}** "
+                f"· 거래대금제외 **{liquidity_excluded}** · 금융제외 **{financial_excluded}** "
+                f"· 데이터없음 **{null_count}** "
                 f"&nbsp;·&nbsp; 1단계 통과 **{len(stage1_ok)}** "
                 f"&nbsp;·&nbsp; 최종 결과 **{len(results)}**"
             )
@@ -1573,14 +1467,12 @@ def render_scanner_tab() -> None:
     results   = _dedup_by_ticker(results)
 
     # ── 결과 필터 적용 (디스플레이 레벨) ───────────────────────────────────────
-    sector_sel  = st.session_state.get("sector_multisel", [])
     theme_sel   = st.session_state.get("theme_multisel", [])
     grade_sel   = st.session_state.get("grade_multisel", [])
     pattern_sel = st.session_state.get("pattern_multisel", [])
     filtered = [
         r for r in results
-        if _match_sector_filter(r, sector_sel)
-        and _match_theme_filter(r, theme_sel)
+        if _match_theme_filter(r, theme_sel)
         and _match_grade_filter(r, grade_sel)
         and _match_pattern_filter(r, pattern_sel)
     ]
@@ -1611,8 +1503,6 @@ def render_scanner_tab() -> None:
 
     # ── 검색 결과 헤더 ──────────────────────────────────────────────────────────
     _active_parts: list[str] = []
-    if sector_sel:
-        _active_parts += sector_sel
     if theme_sel:
         _active_parts += [theme_display(t) for t in theme_sel]
     if grade_sel:
@@ -1648,7 +1538,7 @@ def render_scanner_tab() -> None:
         else:
             st.warning(
                 "선택한 필터에 해당하는 종목이 없습니다.\n\n"
-                "다른 시장이나 섹터를 선택하거나 **필터 초기화** 버튼을 눌러보세요."
+                "다른 시장을 선택하거나 **필터 초기화** 버튼을 눌러보세요."
             )
         return
 

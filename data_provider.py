@@ -1,5 +1,7 @@
 import datetime
 import re
+import time
+import random
 import streamlit as st
 import yfinance as yf
 import pandas as pd
@@ -273,20 +275,32 @@ def _extract_news_item(n: dict) -> dict | None:
     return {'title': title, 'url': url}
 
 
-def _parse_rss_items(xml: str) -> list[tuple[str, str, datetime.datetime | None]]:
-    """Return [(title, link, published), ...] from an RSS XML string.
+def _parse_rss_items(
+    xml: str,
+) -> list[tuple[str, str, datetime.datetime | None, str]]:
+    """Return [(title, link, published, source), ...] from an RSS XML string.
 
     `published` is a timezone-aware UTC datetime when the RSS <pubDate> can be
-    parsed, otherwise None.
+    parsed, otherwise None. `source` is the publisher name (from the <source>
+    tag or the trailing " - 출처" suffix Google News appends to titles).
     """
-    items: list[tuple[str, str, datetime.datetime | None]] = []
+    items: list[tuple[str, str, datetime.datetime | None, str]] = []
     for raw in re.findall(r'<item>(.*?)</item>', xml, re.DOTALL):
         title_m = re.search(r'<title>(.*?)</title>', raw, re.DOTALL)
         link_m  = re.search(r'<link>(.*?)</link>', raw, re.DOTALL)
         date_m  = re.search(r'<pubDate>(.*?)</pubDate>', raw, re.DOTALL)
+        src_m   = re.search(r'<source[^>]*>(.*?)</source>', raw, re.DOTALL)
         if not title_m:
             continue
         title = re.sub(r'<!\[CDATA\[|\]\]>', '', title_m.group(1)).strip()
+        # publisher name: prefer the <source> tag, else the " - 출처" suffix
+        source = ''
+        if src_m:
+            source = re.sub(r'<!\[CDATA\[|\]\]>', '', src_m.group(1)).strip()
+        if not source:
+            suffix_m = re.search(r'\s+-\s+([^\-]{2,40})\s*$', title)
+            if suffix_m:
+                source = suffix_m.group(1).strip()
         # strip trailing " - 출처이름" suffix common in Google News
         title = re.sub(r'\s+-\s+[^\-]{2,40}\s*$', '', title).strip()
         link  = link_m.group(1).strip() if link_m else ''
@@ -299,15 +313,15 @@ def _parse_rss_items(xml: str) -> list[tuple[str, str, datetime.datetime | None]
             except Exception:
                 published = None
         if title:
-            items.append((title, link, published))
+            items.append((title, link, published, source))
     return items
 
 
 def _recent_sorted(
-    items: list[tuple[str, str, datetime.datetime | None]],
+    items: list[tuple[str, str, datetime.datetime | None, str]],
     days: int = 3,
     limit: int = 5,
-) -> list[tuple[str, str, datetime.datetime]]:
+) -> list[tuple[str, str, datetime.datetime, str]]:
     """Keep items published within `days`, sorted newest-first, capped at `limit`.
 
     Items without a parseable publish date are dropped — recency can't be
@@ -316,8 +330,8 @@ def _recent_sorted(
     now    = datetime.datetime.now(datetime.timezone.utc)
     cutoff = now - datetime.timedelta(days=days)
     dated  = [
-        (title, link, pub.astimezone(datetime.timezone.utc))
-        for title, link, pub in items
+        (title, link, pub.astimezone(datetime.timezone.utc), source)
+        for title, link, pub, source in items
         if pub is not None and pub.astimezone(datetime.timezone.utc) >= cutoff
     ]
     dated.sort(key=lambda t: t[2], reverse=True)
@@ -326,19 +340,173 @@ def _recent_sorted(
 
 def _make_news_item(
     original: str,
-    translated: str,
     url: str,
     published: datetime.datetime,
+    source: str = '',
+    subject: str = '',
 ) -> dict:
-    label, score = news_sentiment.analyze(f"{original} {translated}")
+    """Build a news item with a deterministic Korean headline (no translation).
+
+    `subject` is the ticker (US) or company name (KR) used as the headline prefix.
+    The Korean headline is synthesized from the original title's finance topics +
+    sentiment, so it is ALWAYS Korean and English-only headlines never appear.
+    """
+    label, score = news_sentiment.analyze(original)
+    headline_ko  = _compose_headline_ko(original, subject, label)
     return {
-        'original':   original,
-        'translated': translated,
-        'url':        url,
-        'published':  published,
-        'sentiment':  label,
-        'sent_score': score,
+        'original':    original,
+        'headline_ko': headline_ko,
+        # 'translated' kept for backward compatibility (now = the Korean headline)
+        'translated':  headline_ko,
+        'url':         url,
+        'published':   published,
+        'source':      source,
+        'sentiment':   label,
+        'sent_score':  score,
+        'summary_ko':  _compose_summary_ko(headline_ko, label, score),
     }
+
+
+def _is_mostly_korean(text: str) -> bool:
+    han     = sum(1 for c in text if '\uac00' <= c <= '\ud7a3')
+    letters = sum(1 for c in text if c.isalpha())
+    return letters > 0 and han / letters > 0.3
+
+
+# ── 한글 헤드라인 생성 (번역 서비스 미사용) ──────────────────────────────────────
+# 무료 번역 서비스(Google/MyMemory)가 이 서버 IP를 차단/쿼터 소진시켜 영어 제목이
+# 그대로 노출되던 문제가 있었다. 그래서 외부 번역에 의존하지 않고, RSS 제목에서
+# 금융 토픽 키워드를 탐지해 결정론적으로 한글 헤드라인을 합성한다. 키워드가 하나도
+# 안 잡히면 감성(긍정/부정/중립) 기반 한글 문구로 폴백 → 영어 단독 헤드라인은 절대
+# 표시되지 않는다. (한국어 RSS 제목은 이미 한글이라 그대로 사용.)
+#
+# 정의 순서 = 우선순위. 각 항목은 (영문 키워드들, 한글 토픽). 더 구체적인 토픽을
+# 위쪽에 둔다. 매칭은 소문자/단어경계 기준(_topic_hit).
+_TOPIC_KO: list[tuple[tuple[str, ...], str]] = [
+    (('upgrade', 'upgraded', 'outperform', 'overweight'),                 '투자의견 상향'),
+    (('downgrade', 'downgraded', 'underperform', 'underweight'),          '투자의견 하향'),
+    (('price target', 'analyst', 'analysts', 'initiates', 'rating'),      '목표주가·투자의견'),
+    (('beat', 'beats', 'tops estimates', 'tops'),                         '실적 호조'),
+    (('miss', 'misses', 'falls short'),                                   '실적 부진'),
+    (('earnings', 'revenue', 'eps', 'quarter', 'quarterly', 'results',
+      'q1', 'q2', 'q3', 'q4'),                                            '실적 발표'),
+    (('guidance', 'forecast', 'outlook', 'raises guidance',
+      'cuts guidance'),                                                   '가이던스·전망'),
+    (('dividend',),                                                       '배당'),
+    (('buyback', 'repurchase', 'repurchases'),                            '자사주 매입'),
+    (('acquire', 'acquires', 'acquisition', 'merger', 'buyout',
+      'takeover'),                                                        '인수·합병'),
+    (('partnership', 'partners', 'deal', 'agreement', 'contract',
+      'collaboration', 'teams up'),                                       '계약·파트너십'),
+    (('lawsuit', 'sues', 'sued', 'settlement', 'litigation'),             '소송'),
+    (('sec', 'probe', 'investigation', 'antitrust', 'regulator',
+      'fine', 'fined'),                                                   '조사·규제'),
+    (('fda', 'approval', 'approved', 'cleared'),                          '승인'),
+    (('launch', 'launches', 'unveils', 'unveil', 'release', 'releases',
+      'introduces', 'debut'),                                             '신제품·서비스 출시'),
+    (('recall', 'recalls'),                                               '리콜'),
+    (('layoff', 'layoffs', 'job cuts', 'restructuring'),                  '감원·구조조정'),
+    (('bankruptcy', 'default', 'insolvency', 'chapter 11'),               '재무 위기'),
+    (('stock split', 'split'),                                            '주식 분할'),
+    (('ipo', 'public offering', 'goes public'),                           '상장·공모'),
+    (('ceo', 'cfo', 'executive', 'resigns', 'resign', 'steps down',
+      'appoints', 'appointed'),                                          '경영진 변동'),
+    (('insider', 'sells shares', 'sold shares', 'buys shares',
+      'bought shares', 'stake'),                                          '내부자·지분 거래'),
+    (('short seller', 'short interest', 'short report'),                  '공매도'),
+    (('artificial intelligence', ' ai ', 'chip', 'chips', 'semiconductor',
+      'gpu'),                                                             'AI·반도체'),
+    (('electric vehicle', ' ev ', 'battery'),                             '전기차·배터리'),
+    (('surge', 'surges', 'soar', 'soars', 'jump', 'jumps', 'rally',
+      'rallies', 'rockets', 'spike', 'spikes', 'record high',
+      'all-time high', 'hits high'),                                      '주가 급등·강세'),
+    (('plunge', 'plunges', 'tumble', 'tumbles', 'sink', 'sinks', 'crash',
+      'slump', 'slumps', 'drop', 'drops', 'fall', 'falls', 'slide',
+      'slides'),                                                          '주가 하락·약세'),
+]
+
+_SENT_FALLBACK_KO = {
+    news_sentiment.LABEL_POSITIVE: '긍정적 소식',
+    news_sentiment.LABEL_NEGATIVE: '부정적 소식',
+    news_sentiment.LABEL_NEUTRAL:  '주요 동향',
+}
+
+
+def _topic_hit(keyword: str, text_lower: str) -> bool:
+    """Whitespace-padded substring match (text is space-padded by caller)."""
+    if keyword.isascii():
+        return f' {keyword.strip()} ' in text_lower or keyword in text_lower
+    return keyword in text_lower
+
+
+def _detect_topics_ko(title: str, max_topics: int = 2) -> list[str]:
+    """Detect up to `max_topics` Korean finance topics from an English title."""
+    if not title:
+        return []
+    lower = f' {title.lower()} '
+    found: list[str] = []
+    for keywords, ko in _TOPIC_KO:
+        if any(_topic_hit(k, lower) for k in keywords):
+            if ko not in found:
+                found.append(ko)
+        if len(found) >= max_topics:
+            break
+    return found
+
+
+def _compose_headline_ko(title: str, subject: str, label: str) -> str:
+    """Deterministically build a Korean headline (no translation service).
+
+    Korean RSS titles are returned as-is. For English titles we synthesize a
+    headline from detected finance topics + the ticker/company subject, falling
+    back to a sentiment phrase so the result is ALWAYS Korean (never English-only).
+    """
+    if _is_mostly_korean(title):
+        return title.strip()
+    subj   = (subject or '').strip()
+    topics = _detect_topics_ko(title)
+    body   = '·'.join(topics) if topics else _SENT_FALLBACK_KO.get(
+        label, _SENT_FALLBACK_KO[news_sentiment.LABEL_NEUTRAL])
+    # Invariant: the result is ALWAYS Korean (never the English title). `body` is
+    # always a Korean phrase (topic or sentiment fallback), so even an empty
+    # subject yields a Korean headline.
+    return f"{subj} · {body}" if subj else body
+
+
+_SENT_SUMMARY_KO = {
+    news_sentiment.LABEL_POSITIVE: '긍정적 신호로 주가에 우호적으로 작용할 수 있습니다.',
+    news_sentiment.LABEL_NEGATIVE: '부정적 요인으로 주가에 부담을 줄 수 있습니다.',
+    news_sentiment.LABEL_NEUTRAL:  '시장에 미치는 영향은 제한적일 것으로 보입니다.',
+}
+
+
+def _impact_word(impact: int) -> str:
+    if impact >= 70:
+        return '높음'
+    if impact >= 55:
+        return '다소 높음'
+    if impact <= 30:
+        return '낮음'
+    if impact <= 45:
+        return '다소 낮음'
+    return '보통'
+
+
+def _compose_summary_ko(headline_ko: str, label: str, score: float) -> str:
+    """Build a short 2~3 line Korean summary from the data we have for free.
+
+    No article body is fetched, no LLM and no translation service is used, so we
+    cannot invent article facts. The Korean headline carries the topic; we add a
+    sentiment + impact reading so the user can grasp the takeaway from the list.
+    """
+    impact = max(0, min(100, int(round(50 + float(score or 0.0) * 50))))
+    head   = (headline_ko or '').strip().rstrip('.')
+    lines  = []
+    if head:
+        lines.append(f"📰 {head}.")
+    lines.append(f"📊 시장 반응: {_SENT_SUMMARY_KO.get(label, _SENT_SUMMARY_KO[news_sentiment.LABEL_NEUTRAL])}")
+    lines.append(f"⚡ 영향도 {impact}/100 ({_impact_word(impact)})")
+    return '\n'.join(lines)
 
 
 def _fetch_naver_news(code: str, count: int = 5) -> list[dict]:
@@ -355,8 +523,9 @@ def _fetch_naver_news(code: str, count: int = 5) -> list[dict]:
         r.raise_for_status()
         recent = _recent_sorted(_parse_rss_items(r.text), days=3, limit=count)
         return [
-            _make_news_item(original=title, translated=title, url=link, published=pub)
-            for title, link, pub in recent
+            _make_news_item(original=title, url=link, published=pub,
+                            source=source, subject=company_name)
+            for title, link, pub, source in recent
         ]
     except Exception as exc:
         print(f"[KR news ERROR] {type(exc).__name__}: {exc}")
@@ -364,7 +533,8 @@ def _fetch_naver_news(code: str, count: int = 5) -> list[dict]:
 
 
 def _fetch_us_news(ticker: str, count: int = 5) -> list[dict]:
-    """Fetch US stock-specific news via Google News RSS, translated to Korean."""
+    """Fetch US stock-specific news via Google News RSS (Korean headline synthesized,
+    no translation service used)."""
     try:
         import requests
         url = (f"https://news.google.com/rss/search?"
@@ -372,24 +542,28 @@ def _fetch_us_news(ticker: str, count: int = 5) -> list[dict]:
         r = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=8)
         r.raise_for_status()
         recent = _recent_sorted(_parse_rss_items(r.text), days=3, limit=count)
-        items: list[dict] = []
-        for title, link, pub in recent:
-            try:
-                translated = GoogleTranslator(source='auto', target='ko').translate(title)
-            except Exception:
-                translated = title
-            items.append(_make_news_item(original=title, translated=translated,
-                                         url=link, published=pub))
-        return items
+        return [
+            _make_news_item(original=title, url=link, published=pub,
+                            source=source, subject=ticker.upper())
+            for title, link, pub, source in recent
+        ]
     except Exception as exc:
         print(f"[US news ERROR] {type(exc).__name__}: {exc}")
         return []
+
+
+# ── 뉴스 원문 상세 ───────────────────────────────────────────────────────────────
+# 기사 본문 크롤링/번역 기능은 제거됨. 무료(키 없는) 번역 서비스가 이 서버 IP를
+# 차단하고 본문 추출 성공률도 낮아 비용 대비 신뢰성이 떨어졌다. 대신 뉴스 카드에
+# 한글 제목 + 짧은 한글 요약(_compose_summary_ko)을 바로 보여주고, 제목을 누르면
+# 원문 기사로 바로 이동한다(news_view.render_news_section).
 
 
 def _build_result(hist: pd.DataFrame, news: list) -> dict | None:
     if hist is None or hist.empty or len(hist) < 20:
         return None
     hist = hist.copy()
+    hist['MA5']   = hist['Close'].rolling(5).mean()
     hist['MA10']  = hist['Close'].rolling(10).mean()
     hist['MA20']  = hist['Close'].rolling(20).mean()
     hist['MA60']  = hist['Close'].rolling(60).mean()
@@ -546,7 +720,8 @@ def get_kr_yf_industry(code: str, market_en: str) -> str:
         return ''
 
 
-@st.cache_data(ttl=86400, show_spinner=False)
+# 시세 신선도 유지(15분) — get_data_us 주석 참고. 24h 캐시는 하루 지난 가격을 보여준다.
+@st.cache_data(ttl=900, show_spinner=False)
 def get_data_kr(code: str) -> dict | None:
     try:
         start  = (datetime.date.today() - datetime.timedelta(days=620)).strftime('%Y-%m-%d')
@@ -567,46 +742,179 @@ def get_data_kr(code: str) -> dict | None:
         return None
 
 
-@st.cache_data(ttl=86400, show_spinner=False)
-def get_data_us(ticker: str) -> dict | None:
-    try:
-        stock = yf.Ticker(ticker)
-        hist  = stock.history(period="2y")
-        if hist.empty:
-            return None
-        hist       = hist[['Open', 'High', 'Low', 'Close', 'Volume']].dropna()
-        news_items = _fetch_us_news(ticker)
-        result     = _build_result(hist, news_items)
-        if result is None:
-            return None
+def _yf_history_with_retry(stock: "yf.Ticker", attempts: int = 3):
+    """Fetch yfinance OHLCV history, retrying on Yahoo rate-limit errors.
+
+    Yahoo Finance frequently returns `YFRateLimitError` ("Too Many Requests")
+    from datacenter IPs even for perfectly valid tickers. A single attempt would
+    surface as "unsupported ticker" to the user, so we retry with jittered
+    backoff before giving up and letting the caller fall back to FinanceDataReader.
+    Returns a non-empty DataFrame on success, else None.
+    """
+    for i in range(attempts):
         try:
-            info        = stock.info
-            sector_en   = info.get('sector', '')
-            industry_en = info.get('industry', '')
-            result['company_name'] = info.get('longName') or info.get('shortName') or ticker
-            result['quote_type']   = info.get('quoteType', 'EQUITY')
-            result['industry_en']  = industry_en
-            result['sector']       = _YF_SECTOR_KO.get(sector_en, sector_en)
-            # Industry: lookup table → Google Translate → English fallback
-            result['industry'] = _YF_INDUSTRY_KO.get(industry_en, '')
-            if not result['industry'] and industry_en:
-                try:
-                    result['industry'] = GoogleTranslator(source='en', target='ko').translate(industry_en)
-                except Exception:
-                    result['industry'] = industry_en
+            hist = stock.history(period="2y")
+            if hist is not None and not hist.empty:
+                return hist
         except Exception:
-            result['company_name'] = ticker
-            result['sector']       = ''
-            result['industry']     = ''
-        return result
+            pass
+        if i < attempts - 1:
+            time.sleep(0.6 * (i + 1) + random.uniform(0, 0.4))
+    return None
+
+
+def _fdr_history_us(ticker: str):
+    """US OHLCV history via FinanceDataReader — fallback when yfinance is rate-limited.
+
+    FinanceDataReader pulls from a different source (Stooq) and is not subject to
+    Yahoo's rate limiting, so it reliably serves valid US tickers (SOFI, RDW, …)
+    when yfinance returns nothing. Returns the standard OHLCV frame or None.
+    """
+    try:
+        start = (datetime.date.today() - datetime.timedelta(days=820)).strftime('%Y-%m-%d')
+        hist  = fdr.DataReader(ticker, start)
+        if hist is None or hist.empty:
+            return None
+        return hist[['Open', 'High', 'Low', 'Close', 'Volume']].dropna()
     except Exception:
         return None
 
 
+# 가격/시세 데이터는 신선해야 한다 — 기존 24h 캐시가 하루 지난 가격을 그대로
+# 보여줘 현재가·등락률이 실제 시장과 어긋났다(RDW 데이터 부정확 버그). 15분 캐시로
+# 낮춰 장중 움직임을 반영하면서도 한 번의 스캔 안에서는 재사용해 야후 레이트리밋
+# 폭주를 피한다. (가격/전일종가/등락률은 모두 동일한 hist['Close']에서 계산.)
+def _session_quote(info: dict, daily_close: float | None) -> tuple[float | None, float | None]:
+    """현재 거래 세션(프리마켓·정규장·애프터마켓)에 맞는 '표시용' (가격, 등락률) 반환.
+
+    yfinance .info 의 세션별 필드를 marketState 로 선택한다 — 표시용 시세만 다루며
+    패턴/추세 계산용 hist 와는 무관하다.
+      · PRE(프리)   → preMarketPrice  / preMarketChangePercent
+      · POST/CLOSED → postMarketPrice / postMarketChangePercent
+      · 그 외(정규장) → regularMarketPrice / regularMarketChangePercent
+    세션 시세가 없으면 정규장 → currentPrice → 일봉 종가(daily_close) 순으로 폴백.
+    등락률 필드가 없으면 적정 기준가(프리/애프터=직전 정규장가, 정규장=전일종가)로 재계산.
+    """
+    def f(x):
+        try:
+            return float(x) if x is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    state    = str(info.get('marketState') or '').upper()
+    reg_px   = f(info.get('regularMarketPrice')) or f(info.get('currentPrice'))
+    reg_prev = f(info.get('regularMarketPreviousClose')) or f(info.get('previousClose'))
+    reg_chg  = f(info.get('regularMarketChangePercent'))
+
+    def chg(px, base, given):
+        if given is not None:
+            return given
+        if px is not None and base:
+            return (px - base) / base * 100.0
+        return None
+
+    # 프리마켓: 등락률 기준은 직전 정규장 종가(reg_px)
+    if state.startswith('PRE'):
+        px = f(info.get('preMarketPrice'))
+        if px:
+            return px, chg(px, reg_px, f(info.get('preMarketChangePercent')))
+    # 애프터마켓/마감: 등락률 기준은 정규장 종가(reg_px)
+    if state.startswith('POST') or state == 'CLOSED':
+        px = f(info.get('postMarketPrice'))
+        if px:
+            return px, chg(px, reg_px, f(info.get('postMarketChangePercent')))
+    # 정규장 또는 세션 시세 부재
+    if reg_px:
+        return reg_px, chg(reg_px, reg_prev, reg_chg)
+    if daily_close:
+        return daily_close, None
+    return None, None
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def get_data_us(ticker: str) -> dict | None:
+    stock = None
+    hist  = None
+    # 1) Primary: yfinance with retry on rate-limit.
+    try:
+        stock = yf.Ticker(ticker)
+        raw   = _yf_history_with_retry(stock)
+        if raw is not None:
+            hist = raw[['Open', 'High', 'Low', 'Close', 'Volume']].dropna()
+    except Exception:
+        hist = None
+
+    # 2) Fallback: FinanceDataReader (different source, no Yahoo rate limit).
+    if hist is None or hist.empty:
+        hist = _fdr_history_us(ticker)
+
+    # Both sources failed → the ticker is genuinely unavailable.
+    if hist is None or hist.empty:
+        return None
+
+    news_items = _fetch_us_news(ticker)
+    result     = _build_result(hist, news_items)
+    if result is None:
+        return None
+
+    # Company metadata via yfinance .info — best-effort; never fatal (the price
+    # series above already succeeded, possibly from the fdr fallback).
+    info: dict = {}
+    try:
+        info        = stock.info if stock is not None else {}
+        sector_en   = info.get('sector', '')
+        industry_en = info.get('industry', '')
+        result['company_name'] = info.get('longName') or info.get('shortName') or ticker
+        result['quote_type']   = info.get('quoteType', 'EQUITY')
+        result['industry_en']  = industry_en
+        result['sector']       = _YF_SECTOR_KO.get(sector_en, sector_en)
+        # Industry: lookup table → Google Translate → English fallback
+        result['industry'] = _YF_INDUSTRY_KO.get(industry_en, '')
+        if not result['industry'] and industry_en:
+            try:
+                result['industry'] = GoogleTranslator(source='en', target='ko').translate(industry_en)
+            except Exception:
+                result['industry'] = industry_en
+    except Exception:
+        result['company_name'] = ticker
+        result['sector']       = ''
+        result['industry']     = ''
+
+    # 시세 정확도(quote accuracy) — 현재 거래 세션 반영: 일봉 히스토리의 마지막 행은
+    # '마지막 *완료* 세션'이라 새 세션 동안 실시간 시세와 어긋난다(RDW: 히스토리 18.62
+    # vs 실시간). get_data_us 는 위에서 *이미* info 를 받았으므로(추가 네트워크 호출 없음)
+    # marketState 에 따라 프리마켓/정규장/애프터마켓 시세로 표시 price·change_pct 를
+    # 보정한다(_session_quote). 패턴·추세용 hist 는 그대로 둔다. yfinance 가 막혀 FDR
+    # 폴백을 쓴 경우엔 info 가 비어 보정이 적용되지 않고 일봉 종가가 그대로 쓰인다.
+    try:
+        result['market_session'] = str(info.get('marketState') or '').upper()
+        daily_close = result.get('price')   # _build_result 가 넣어둔 일봉 마지막 종가
+        sess_px, sess_chg = _session_quote(info, daily_close)
+        if sess_px and sess_px > 0:
+            result['price'] = sess_px
+            if sess_chg is not None:
+                result['change_pct'] = sess_chg
+            elif daily_close and daily_close > 0:
+                # 세션 등락률·기준가가 모두 없을 때: price 와 일관되게 일봉 종가 기준으로
+                # 재계산해 '새 가격 vs 과거 일봉 등락률' 불일치를 방지.
+                result['change_pct'] = (sess_px - daily_close) / daily_close * 100.0
+    except Exception:
+        pass
+    return result
+
+
 def get_data(code_or_ticker: str, market: str = 'auto') -> dict | None:
     s = code_or_ticker.strip()
-    if '.' in s:
-        s = s.split('.')[0]
-    if market == 'kr' or (market == 'auto' and s.isdigit() and len(s) == 6):
+    up = s.upper()
+
+    # 한국 종목 — .KS/.KQ 접미사 또는 6자리 숫자 코드.
+    if up.endswith('.KS') or up.endswith('.KQ'):
+        return get_data_kr(s.split('.')[0].zfill(6))
+    if market == 'kr':
+        return get_data_kr(s.split('.')[0].zfill(6))
+    if market == 'auto' and s.isdigit() and len(s) == 6:
         return get_data_kr(s.zfill(6))
-    return get_data_us(s)
+
+    # 미국 종목 — yfinance 는 클래스주에 '.' 대신 '-' 를 쓴다 (예: BRK.B → BRK-B).
+    us_ticker = up.replace('.', '-')
+    return get_data_us(us_ticker)

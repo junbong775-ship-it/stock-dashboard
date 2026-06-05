@@ -57,37 +57,6 @@ def detect_double_bottom(df: pd.DataFrame) -> tuple[bool, float, str]:
     return detected, round(max(0.0, confidence), 2), description
 
 
-def detect_box_breakout(df: pd.DataFrame) -> tuple[bool, float, str]:
-    """Price breaking above a recent resistance range with volume confirmation."""
-    if len(df) < 30:
-        return False, 0.0, "데이터 부족"
-
-    box    = df.iloc[-30:-5]
-    recent = df.iloc[-5:]
-
-    resistance  = box['High'].max()
-    box_floor   = box['Low'].min()
-    box_range   = resistance - box_floor
-    current     = float(df['Close'].iloc[-1])
-    avg_vol_box = box['Volume'].mean()
-    avg_vol_now = recent['Volume'].mean()
-
-    if box_range <= 0 or avg_vol_box <= 0:
-        return False, 0.0, "패턴 없음"
-
-    breakout     = current > resistance
-    vol_confirm  = avg_vol_now > avg_vol_box * 1.3
-    breakout_pct = (current - resistance) / resistance if resistance > 0 else 0
-
-    detected    = breakout and vol_confirm
-    confidence  = min(1.0, breakout_pct * 20) if detected else 0.0
-    description = (
-        f"박스권 돌파 감지 — 저항선 {resistance:,.2f} 상향 돌파, "
-        f"거래량 {avg_vol_now/avg_vol_box:.1f}배"
-    ) if detected else "패턴 없음"
-    return detected, round(confidence, 2), description
-
-
 def detect_golden_cross(df: pd.DataFrame) -> tuple[bool, float, str]:
     """MA20 crossing above MA60 within the last 20 bars."""
     if 'MA20' not in df.columns or 'MA60' not in df.columns:
@@ -185,29 +154,6 @@ def detect_near_high(df: pd.DataFrame) -> tuple[bool, float, str]:
         desc = f"52주 신고가 도달 — {high_52w:,.2f}"
     else:
         desc = f"52주 신고가 근처 — 고점 대비 -{gap*100:.1f}%"
-    return True, round(confidence, 2), desc
-
-
-def detect_volume_surge(df: pd.DataFrame) -> tuple[bool, float, str]:
-    """최근 20일 평균 거래량 대비 150% 이상 급증."""
-    if 'Volume' not in df.columns or len(df) < 22:
-        return False, 0.0, "데이터 부족"
-
-    vol        = df['Volume'].values
-    avg_vol20  = vol[-21:-1].mean()
-    today_vol  = float(vol[-1])
-
-    if avg_vol20 <= 0:
-        return False, 0.0, "거래량 데이터 없음"
-
-    ratio    = today_vol / avg_vol20
-    detected = ratio >= 1.5
-
-    if not detected:
-        return False, 0.0, "패턴 없음"
-
-    confidence = min(1.0, (ratio - 1.5) / 2.5 + 0.4)
-    desc       = f"거래량 급증 — 20일 평균 대비 {ratio:.1f}배 ({ratio*100:.0f}%)"
     return True, round(confidence, 2), desc
 
 
@@ -314,6 +260,86 @@ def detect_ma20_pullback(df: pd.DataFrame) -> tuple[bool, float, str]:
         f"MA20 대비 {deviation*100:.1f}% 이내"
         + (", 거래량 감소 확인" if vol_declining else "")
     )
+    return True, round(confidence, 2), desc
+
+
+def detect_first_pullback(df: pd.DataFrame) -> tuple[bool, float, str]:
+    """첫 눌림목 — MA10/MA20 정배열 눌림목 중 신뢰도 높은 쪽을 채택.
+
+    기존 MA10 눌림목(detect_ma10_pullback)·MA20 눌림목(detect_ma20_pullback)을
+    하나의 정규 패턴으로 통합한다. 둘 다 감지되면 신뢰도(confidence)가 더 높은
+    쪽을 사용한다.
+    """
+    d10, c10, desc10 = detect_ma10_pullback(df)
+    d20, c20, desc20 = detect_ma20_pullback(df)
+    if not (d10 or d20):
+        return False, 0.0, "패턴 없음"
+    if d10 and (not d20 or c10 >= c20):
+        return True, c10, "첫 눌림목 — " + desc10
+    return True, c20, "첫 눌림목 — " + desc20
+
+
+# 5·10·20일선 수렴 — 세 이평선 밀집도(최대-최소)/현재가 임계값
+MA_CONVERGENCE_BAND = 0.025
+
+
+def detect_ma_convergence(df: pd.DataFrame) -> tuple[bool, float, str]:
+    """5·10·20일선 수렴 — 단기 이평선이 현재가 대비 2.5% 이내로 밀집."""
+    for col in ('MA5', 'MA10', 'MA20'):
+        if col not in df.columns:
+            return False, 0.0, "이동평균선 데이터 없음"
+
+    window = df.dropna(subset=['MA5', 'MA10', 'MA20'])
+    if window.empty:
+        return False, 0.0, "데이터 부족"
+
+    ma5   = float(window['MA5'].iloc[-1])
+    ma10  = float(window['MA10'].iloc[-1])
+    ma20  = float(window['MA20'].iloc[-1])
+    close = float(window['Close'].iloc[-1])
+    if close <= 0:
+        return False, 0.0, "데이터 부족"
+
+    spread = (max(ma5, ma10, ma20) - min(ma5, ma10, ma20)) / close
+    if spread > MA_CONVERGENCE_BAND:
+        return False, 0.0, "패턴 없음"
+
+    confidence = min(1.0, (MA_CONVERGENCE_BAND - spread) / MA_CONVERGENCE_BAND * 0.6 + 0.4)
+    desc = f"5·10·20일선 수렴 — 이평 밀집도 {spread*100:.1f}%"
+    return True, round(confidence, 2), desc
+
+
+# 300일선 돌파 시도 — 현재가가 MA300 대비 [-3%, +5%] 밴드 + 최근 30봉 내 MA300 아래였음
+MA300_BREAKOUT_LOW  = -0.03
+MA300_BREAKOUT_HIGH = 0.05
+
+
+def detect_ma300_breakout(df: pd.DataFrame) -> tuple[bool, float, str]:
+    """300일선 돌파 시도 — MA300 근접(아래에서 위로) 구간."""
+    if 'MA300' not in df.columns:
+        return False, 0.0, "MA300 데이터 없음"
+
+    s = df['MA300'].dropna()
+    if s.empty:
+        return False, 0.0, "데이터 부족"
+
+    ma300 = float(s.iloc[-1])
+    close = float(df['Close'].iloc[-1])
+    if ma300 <= 0:
+        return False, 0.0, "MA300 데이터 없음"
+
+    dev = (close - ma300) / ma300
+    if not (MA300_BREAKOUT_LOW <= dev <= MA300_BREAKOUT_HIGH):
+        return False, 0.0, "패턴 없음"
+
+    # 최근 30봉 내 MA300 아래였던 적이 있어야 '아래에서 위로 돌파 시도'로 본다.
+    recent = df.tail(30)
+    was_below = bool((recent['Close'] < recent['MA300']).any()) if 'MA300' in recent.columns else False
+    if not was_below:
+        return False, 0.0, "패턴 없음"
+
+    confidence = min(1.0, (1 - abs(dev) / MA300_BREAKOUT_HIGH) * 0.5 + 0.45)
+    desc = f"300일선 돌파 시도 — MA300 대비 {dev*100:+.1f}%"
     return True, round(confidence, 2), desc
 
 
@@ -509,27 +535,18 @@ def _apply_conf_threshold(
 
 
 def get_all_patterns(df: pd.DataFrame) -> dict:
-    # ① 개별 패턴 독립 평가
-    cup_and_handle  = detect_cup_and_handle(df)
-    double_bottom   = detect_double_bottom(df)
-    box_breakout    = detect_box_breakout(df)
-    golden_cross    = detect_golden_cross(df)
-    new_high        = detect_new_high(df)
-    volume_surge    = detect_volume_surge(df)
-    ma10_pullback   = detect_ma10_pullback(df)
-    ma20_pullback   = detect_ma20_pullback(df)
+    # ① 정규 패턴 7종 독립 평가 (필터·카드·AI 점수에 모두 사용)
+    raw = {
+        'cup_and_handle': detect_cup_and_handle(df),
+        'double_bottom':  detect_double_bottom(df),
+        'ma300_breakout': detect_ma300_breakout(df),
+        'ma_convergence': detect_ma_convergence(df),
+        'first_pullback': detect_first_pullback(df),
+        'new_high':       detect_new_high(df),
+        'golden_cross':   detect_golden_cross(df),
+    }
 
     # ② 신뢰도 30% 임계값 일괄 적용
-    raw = {
-        'new_high':       new_high,
-        'volume_surge':   volume_surge,
-        'golden_cross':   golden_cross,
-        'ma10_pullback':  ma10_pullback,
-        'ma20_pullback':  ma20_pullback,
-        'cup_and_handle': cup_and_handle,
-        'double_bottom':  double_bottom,
-        'box_breakout':   box_breakout,
-    }
     out = {k: _apply_conf_threshold(*v) for k, v in raw.items()}
     # 바닥탈출 셋업(형성/돌파 국면)은 임계값 처리 대상이 아니라 dict 로 별도 첨부.
     out['bottom_setup'] = detect_bottom_setup(df)

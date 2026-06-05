@@ -21,11 +21,24 @@ st.title("🚀 봉봉 트레이더 스캐너")
 st.caption("Momentum Trend Scanner  |  정배열 + 눌림목 + 모멘텀 + 거래대금 기반 AI 주식 스캐너  |  미국(yfinance) · 한국(FinanceDataReader)")
 
 from ui import render_analysis_tab, render_scanner_tab
+from momentum_scanner import render_momentum_tab
+from growth_scanner import render_growth_tab
+from news_view import reset_keys as _reset_news_keys
 
-tab_analysis, tab_scanner = st.tabs(["📊 종목 상세 분석", "🚀 봉봉 스캐너"])
+_reset_news_keys()
+
+tab_analysis, tab_scanner, tab_momentum, tab_growth = st.tabs(
+    ["📊 종목 상세 분석", "🚀 봉봉 스캐너", "🔥 급등주 스캐너", "🌱 미래 10배주"]
+)
 
 with tab_analysis:
     render_analysis_tab()
 
 with tab_scanner:
     render_scanner_tab()
+
+with tab_momentum:
+    render_momentum_tab()
+
+with tab_growth:
+    render_growth_tab()
