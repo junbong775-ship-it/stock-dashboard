@@ -1,172 +1,267 @@
-"""급등주 스캐너 — 소형주 급등 후보를 큐레이션 유니버스에서 탐색한다.
+"""급등주 스캐너 — 전체 시장에서 '급등 직전/초기' 후보를 탐색한다.
 
-.info 조회는 종목당 느리므로 **전체 시장 스캔이 아니라 큐레이션된 소형주 유니버스**만
-ThreadPool 로 병렬 조회한다. 급등 강도 점수는 RVOL(상대 거래량) + 당일 변동률 +
-거래량 증가로 산출(프리마켓 거래량은 무료 데이터에 없음). **화면 표시 시세(price·
-당일변동률)는 _session_quote 로 프리/정규/애프터 세션 시세를 반영**해 다른 탭과 일치시킨다.
+추세·정배열·패턴은 보지 않는다. 대신 전체 시장 스냅샷에서 당일 강도(변동률)로 후보를
+압축한 뒤, 벌크 히스토리로 RVOL(상대 거래량)·거래대금 급증(2배↑)·갭을 계산하고
+뉴스 감성과 특이 이벤트(M&A·합병완료·거래재개·FDA 등)를 가점한다.
+S급 이벤트(M&A·SPAC 합병완료·거래정지 후 재개·티커변경 등)는 결과 최상단에 고정한다.
+
+무료 데이터만 사용: 미국=스크리너 스냅샷 + yfinance 히스토리, 한국=FinanceDataReader.
+프리/정규/애프터 세션 시세는 스냅샷(lastsale·Close)을 그대로 표시해 다른 탭과 일치시킨다.
 """
 from __future__ import annotations
 
+import time
 import streamlit as st
-import yfinance as yf
 import pandas as pd
 import html as _html
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 
 import news_sentiment as _sent
-from data_provider import _fetch_us_news, _session_quote
+from data_provider import _fetch_us_news, _fetch_naver_news
+from bulk_data import (
+    fetch_us_snapshot, fetch_kr_snapshot, fetch_us_industry_map, bulk_history,
+)
+from scan_ui import render_stage_funnel, render_session_bar
 from news_view import render_news_section
+# ETF/SPAC·한국 제외 판정은 메인 스캐너와 동일 규칙을 재사용한다.
+from ui import _is_etf_or_spac, _is_kr_excluded
 
-
-# 큐레이션 소형주 유니버스 — 변동성 높은 저가 소형주 중심(전체 스캔 대체).
-MOMENTUM_UNIVERSE: list[str] = [
-    "LUNR", "ASTS", "RKLB", "PL", "IRDM", "BBAI", "SOUN", "RGTI", "QUBT", "QBTS",
-    "IONQ", "ARQQ", "LAES", "OUST", "MVIS", "LIDR", "INDI", "NVTS", "WOLF", "LCID",
-    "CHPT", "PLUG", "FCEL", "BLNK", "RUN", "SES", "QS", "ACHR", "JOBY", "EVTL",
-    "DNA", "RXRX", "TMC", "MARA", "RIOT",
-]
-
-# RVOL(상대 거래량) 점수 구간 — 1.5~3x 최선, 3~5x 양호, 5x↑ 과열, 10x↑ 추격주의
-MCAP_MAX     = 300_000_000     # 시총 상한 (소형주 정의)
-PRICE_MIN    = 0.5
-PRICE_MAX    = 10.0
+# 스냅샷 강도 상위에서 심층 분석할 종목 수 상한 (벌크 다운로드 ~10종목/초 → ~40초).
+_US_CAP = 250
+_KR_CAP = 150
+_KRW_PER_USD = 1_350
 
 
 def _rvol_tier(rvol: float) -> tuple[int, str, str]:
     """RVOL → (점수, 라벨, 색). 1.5~3x 최선, 3~5x 양호, 5x↑ 과열, 10x↑ 추격주의."""
     if rvol >= 10:
-        return 10, "추격 주의 (10x↑)", "#FF5252"
+        return 12, "추격 주의 (10x↑)", "#FF5252"
     if rvol >= 5:
-        return 20, "과열 경고 (5x↑)", "#FF7043"
+        return 22, "과열 경고 (5x↑)", "#FF7043"
     if rvol >= 3:
-        return 30, "양호 (3~5x)", "#69F0AE"
+        return 32, "양호 (3~5x)", "#69F0AE"
     if rvol >= 1.5:
         return 40, "최선 (1.5~3x)", "#00C851"
     if rvol >= 1.2:
-        return 15, "보통 (1.2~1.5x)", "#FFB300"
+        return 18, "보통 (1.2~1.5x)", "#FFB300"
     return 0, "약함 (<1.2x)", "#90A4AE"
 
 
-def _scan_one(ticker: str) -> dict | None:
+def _value_surge_pts(ratio: float) -> tuple[int, str]:
+    """거래대금 급증(최근 vs 직전 20일 평균) → (점수, 라벨)."""
+    if ratio >= 3:
+        return 20, f"폭증 ({ratio:.1f}x)"
+    if ratio >= 2:
+        return 15, f"급증 ({ratio:.1f}x)"
+    if ratio >= 1.5:
+        return 8, f"증가 ({ratio:.1f}x)"
+    return 0, f"보통 ({ratio:.1f}x)"
+
+
+def _score_one(snap: dict, hist: pd.DataFrame, market: str) -> dict | None:
+    """스냅샷 + 히스토리로 급등 강도 점수를 산출. 추세/패턴은 보지 않는다."""
     try:
-        tk   = yf.Ticker(ticker)
-        hist = tk.history(period="3mo")
-        if hist is None or hist.empty:
+        if hist is None or len(hist) < 20:
             return None
-        # 프리마켓에는 yfinance 가 '오늘'의 NaN 일봉을 덧붙여 마지막 종가가 NaN 이 되고,
-        # 그러면 close/prev/당일변동률(intraday)이 NaN → min/max 클램프가 NaN 을 거르지
-        # 못해 점수가 오염된다. NaN 종가 행을 제거해 iloc[-1] 이 '직전 완성 일봉'을 가리키게 한다.
-        hist = hist.dropna(subset=["Close"])
-        if len(hist) < 20:
+        h = hist.dropna(subset=["Close"])
+        if len(h) < 20:
             return None
-        close   = float(hist["Close"].iloc[-1])
-        prev    = float(hist["Close"].iloc[-2])
-        vol     = float(hist["Volume"].iloc[-1])
-        avg_vol = float(hist["Volume"].tail(20).mean())
-        if avg_vol <= 0 or close <= 0:
+        close   = float(h["Close"].iloc[-1])
+        vol     = float(h["Volume"].iloc[-1])
+        avg_vol = float(h["Volume"].tail(20).mean())
+        if close <= 0 or avg_vol <= 0:
             return None
 
-        # 가격 필터 (저가 소형주)
-        if not (PRICE_MIN <= close <= PRICE_MAX):
-            return None
-
-        # 펀더멘털 (.info — 느림, 큐레이션 유니버스라 허용)
-        info = {}
+        rvol = vol / avg_vol
+        # 거래대금 급증: 최근 5일 평균 vs 직전 20일 평균
+        recent5 = float((h["Close"] * h["Volume"]).tail(5).mean())
+        base20  = float((h["Close"] * h["Volume"]).tail(25).head(20).mean())
+        val_ratio = recent5 / base20 if base20 > 0 else 1.0
+        # 갭(직전 종가 대비 당일 시가)
         try:
-            info = tk.info or {}
+            gap = (float(h["Open"].iloc[-1]) - float(h["Close"].iloc[-2])) / float(h["Close"].iloc[-2]) * 100.0
         except Exception:
-            info = {}
-        mcap  = info.get("marketCap") or 0
-        flt   = info.get("floatShares") or info.get("sharesOutstanding") or 0
-        # 시총 필터 (정보 있을 때만)
-        if mcap and mcap > MCAP_MAX:
-            return None
+            gap = 0.0
 
-        rvol      = vol / avg_vol
-        intraday  = (close - prev) / prev * 100.0
-        # 최근 5일 vs 직전 20일 거래량 증가
-        recent5   = float(hist["Volume"].tail(5).mean())
-        base20    = float(hist["Volume"].tail(25).head(20).mean()) or avg_vol
-        vol_inc   = recent5 / base20 if base20 > 0 else 1.0
+        # 표시 시세는 세션 스냅샷(프리/정규/애프터) 우선
+        disp_price = snap.get("price") or close
+        disp_chg   = snap.get("change_pct")
+        if disp_chg is None:
+            disp_chg = 0.0
 
-        # 뉴스 (감성)
-        try:
-            news = _fetch_us_news(ticker)
-        except Exception:
-            news = []
-        news_score = _sent.overall_score(news) if news else 50
-
-        # ── 점수 산출 ──────────────────────────────────────────────────────
-        rvol_pts, rvol_label, rvol_col = _rvol_tier(rvol)
-        intraday_pts = max(0, min(20, intraday))           # 당일 상승률 (최대 +20)
-        volinc_pts   = 15 if vol_inc >= 1.5 else 8 if vol_inc >= 1.2 else 0
-        news_pts     = (news_score - 50) / 50 * 15         # -15 ~ +15
-        score = round(rvol_pts + intraday_pts + volinc_pts + news_pts)
-        score = max(0, min(100, score))
-
-        # 표시용 세션 시세(프리/정규/애프터) — 위에서 이미 받은 info 재사용(추가 호출 없음).
-        # 점수는 위에서 일봉 기준으로 이미 산출됐고, 여기서는 화면 표시용 price/당일변동률만
-        # 세션 시세로 보정한다(가격과 % 의 기준이 어긋나지 않도록 둘을 함께 교체).
-        sess_px, sess_chg = _session_quote(info, close)
-        if sess_px and sess_px > 0:
-            disp_price = sess_px
-            # 세션 price 적용 시 % 도 같은 기준이어야 함: 세션 %가 없으면 일봉 종가 대비
-            # 재계산(과거 일봉 % 를 새 price 옆에 그대로 두지 않는다).
-            disp_chg = sess_chg if sess_chg is not None else (sess_px - close) / close * 100.0
+        # 거래대금(표시용, KRW 기준 정규화)
+        if market == "us":
+            tv_krw = recent5 * _KRW_PER_USD
         else:
-            disp_price = close
-            disp_chg   = intraday
+            tv_krw = float(snap.get("amount") or recent5)
 
         return {
-            "ticker":     ticker,
-            "price":      disp_price,
-            "intraday":   disp_chg,
-            "market_session": str(info.get("marketState") or "").upper(),
-            "rvol":       rvol,
-            "rvol_label": rvol_label,
-            "rvol_col":   rvol_col,
-            "vol_inc":    vol_inc,
-            "mcap":       mcap,
-            "float":      flt,
-            "news":       news,
-            "news_score": news_score,
-            "score":      score,
+            "code": snap.get("code") or snap.get("symbol"),
+            "market": market,
+            "price": disp_price,
+            "intraday": float(disp_chg),
+            "rvol": rvol,
+            "val_ratio": val_ratio,
+            "gap": gap,
+            "trading_value": tv_krw,
+            "mcap": snap.get("mcap") or 0.0,
         }
     except Exception:
         return None
 
 
 @st.cache_data(ttl=300, show_spinner=False)
-def scan_momentum() -> list[dict]:
-    """큐레이션 유니버스를 병렬 조회해 급등 후보 리스트(점수 내림차순)를 반환한다."""
-    out: list[dict] = []
-    seen: set[str] = set()
-    universe = [t for t in MOMENTUM_UNIVERSE if not (t in seen or seen.add(t))]
-    with ThreadPoolExecutor(max_workers=10) as ex:
-        futs = {ex.submit(_scan_one, t): t for t in universe}
-        for f in as_completed(futs):
-            r = f.result()
-            if r:
-                out.append(r)
-    out.sort(key=lambda d: d["score"], reverse=True)
-    return out
+def scan_momentum(scan_us: bool = True, scan_kr: bool = True) -> dict:
+    """전체 시장 급등 후보 스캔. 결과 + 단계별 탈락 집계를 반환한다."""
+    t0 = time.time()
+    c_total = c_etf = c_reduced = c_nodata = c_nosignal = 0
+
+    us_snap = fetch_us_snapshot() if scan_us else {}
+    kr_kospi = fetch_kr_snapshot("KOSPI") if scan_kr else {}
+    kr_kosdaq = fetch_kr_snapshot("KOSDAQ") if scan_kr else {}
+    us_ind = fetch_us_industry_map() if (scan_us and us_snap) else {}
+
+    # ── Stage A: ETF/SPAC 제외 + 당일 강도 상위로 압축 ──
+    us_rows: list[dict] = []
+    for sym, row in us_snap.items():
+        c_total += 1
+        excl, _r = _is_etf_or_spac({
+            "company_name": row.get("name", ""),
+            "industry": us_ind.get(sym, ""),
+            "quote_type": "EQUITY",
+        })
+        if excl:
+            c_etf += 1
+            continue
+        us_rows.append(row)
+    us_rows.sort(key=lambda r: (r.get("change_pct") or -999), reverse=True)
+    us_keep = us_rows[:_US_CAP]
+    c_reduced += max(0, len(us_rows) - len(us_keep))
+
+    kr_rows: list[dict] = []
+    for snap_map in (kr_kospi, kr_kosdaq):
+        for code, row in snap_map.items():
+            c_total += 1
+            if _is_kr_excluded(row.get("name", "")):
+                c_etf += 1
+                continue
+            kr_rows.append(row)
+    kr_rows.sort(key=lambda r: (r.get("change_pct") or -999), reverse=True)
+    kr_keep = kr_rows[:_KR_CAP]
+    c_reduced += max(0, len(kr_rows) - len(kr_keep))
+
+    # ── Stage B: 벌크 히스토리 ──
+    hist_map: dict[str, pd.DataFrame] = {}
+    if us_keep:
+        hist_map.update(bulk_history([r["symbol"] for r in us_keep], "us", period="6mo"))
+    if kr_keep:
+        kr_suffix = {r["code"]: ("KS" if r.get("market") == "KOSPI" else "KQ") for r in kr_keep}
+        hist_map.update(bulk_history([r["code"] for r in kr_keep], "kr",
+                                     period="6mo", kr_suffix=kr_suffix))
+
+    # ── Stage C: 점수 + 신호/뉴스/이벤트 ──
+    scored: list[dict] = []
+    for row, market in ([(r, "us") for r in us_keep] + [(r, "kr") for r in kr_keep]):
+        key = row.get("symbol") or row.get("code")
+        hist = hist_map.get(key)
+        if hist is None:
+            c_nodata += 1
+            continue
+        base = _score_one(row, hist, market)
+        if base is None:
+            c_nodata += 1
+            continue
+        base["name"] = row.get("name", key)
+        scored.append(base)
+
+    # 뉴스/이벤트는 1차 신호 통과 후보에만 (속도 보존)
+    def _has_signal(it: dict) -> bool:
+        return (it["rvol"] >= 1.5 or it["val_ratio"] >= 2.0
+                or it["intraday"] >= 5.0 or it["gap"] >= 3.0)
+
+    signal_cands = [it for it in scored if _has_signal(it)]
+    c_nosignal = len(scored) - len(signal_cands)
+
+    def _news_for(it: dict):
+        try:
+            if it["market"] == "us":
+                return it["code"], _fetch_us_news(it["code"])
+            return it["code"], _fetch_naver_news(it["code"])
+        except Exception:
+            return it["code"], []
+
+    news_map: dict[str, list] = {}
+    if signal_cands:
+        try:
+            with ThreadPoolExecutor(max_workers=16) as nx:
+                news_map = dict(nx.map(_news_for, signal_cands))
+        except Exception:
+            news_map = {}
+
+    results: list[dict] = []
+    for it in signal_cands:
+        news = news_map.get(it["code"], [])
+        news_score = _sent.overall_score(news) if news else 50
+        ev_tier, ev_labels = _sent.classify_events(news)
+
+        rvol_pts, rvol_label, rvol_col = _rvol_tier(it["rvol"])
+        val_pts, val_label = _value_surge_pts(it["val_ratio"])
+        intraday_pts = max(0.0, min(25.0, it["intraday"]))
+        gap_pts = 8 if it["gap"] >= 5 else 4 if it["gap"] >= 3 else 0
+        news_pts = (news_score - 50) / 50 * 10
+        ev_pts = 40 if ev_tier == "S" else 15 if ev_tier == "A" else 0
+
+        score = round(rvol_pts + val_pts + intraday_pts + gap_pts + news_pts + ev_pts)
+        score = max(0, min(100, score))
+
+        it.update({
+            "rvol_label": rvol_label, "rvol_col": rvol_col,
+            "val_label": val_label,
+            "news": news, "news_score": news_score,
+            "event_tier": ev_tier, "event_labels": ev_labels,
+            "score": score,
+        })
+        results.append(it)
+
+    # S급 이벤트 최상단 고정, 그다음 점수순
+    results.sort(key=lambda d: (d.get("event_tier") == "S",
+                                d.get("event_tier") == "A",
+                                d["score"]), reverse=True)
+
+    funnel = [
+        ("총 스캔",          c_total,           "total"),
+        ("ETF/제외 종목",    c_etf,             "reject"),
+        ("강도 컷(상위 외)", c_reduced,         "reject"),
+        ("데이터 없음",      c_nodata,          "reject"),
+        ("급등 신호 없음",   c_nosignal,        "reject"),
+        ("급등 후보",        len(results),      "pass"),
+    ]
+    return {"results": results, "funnel": funnel, "elapsed": time.time() - t0}
 
 
-def _fmt_mcap(v) -> str:
-    if not isinstance(v, (int, float)) or v <= 0:
+def _fmt_value(it: dict) -> str:
+    v = it.get("trading_value") or 0.0
+    if v <= 0:
         return "—"
-    if v >= 1e9:
-        return f"${v/1e9:.2f}B"
-    return f"${v/1e6:.0f}M"
+    if it["market"] == "kr":
+        return f"₩{v/1e8:.0f}억"
+    return f"${v/_KRW_PER_USD/1e6:.1f}M"
 
 
 def _card(it: dict) -> str:
-    t   = _html.escape(it["ticker"])
-    url = f"https://m.stock.naver.com/worldstock/stock/{t}.O/total"
+    code = _html.escape(str(it["code"]))
+    name = _html.escape(str(it.get("name", it["code"])))
+    is_kr = it["market"] == "kr"
+    if is_kr:
+        url = f"https://m.stock.naver.com/domestic/stock/{code}/total"
+        px_str = f"₩{it['price']:,.0f}"
+    else:
+        url = f"https://m.stock.naver.com/worldstock/stock/{code}.O/total"
+        px_str = f"${it['price']:,.2f}"
     chg_col = "#00C851" if it["intraday"] >= 0 else "#FF5252"
     chg_str = f"{it['intraday']:+.2f}%"
-    score   = it["score"]
-    sc_col  = "#00C851" if score >= 70 else "#FFB300" if score >= 45 else "#90A4AE"
+    score = it["score"]
+    sc_col = "#00C851" if score >= 70 else "#FFB300" if score >= 45 else "#90A4AE"
 
     def _row(label, value, vcol="#D5D5EE"):
         return (
@@ -177,46 +272,74 @@ def _card(it: dict) -> str:
             f'text-align:right">{value}</span></div>'
         )
 
+    ev_html = ""
+    if it.get("event_tier"):
+        tcol = "#FF4081" if it["event_tier"] == "S" else "#FFB300"
+        labels = " · ".join(_html.escape(x) for x in (it.get("event_labels") or [])[:3])
+        ev_html = (
+            f'<div style="margin:4px 0 8px;"><span style="background:{tcol}22;color:{tcol};'
+            f'border:1px solid {tcol}66;border-radius:8px;padding:2px 8px;font-size:0.72rem;'
+            f'font-weight:700">⚡ {it["event_tier"]}급 이벤트</span> '
+            f'<span style="color:#B5B5D0;font-size:0.74rem">{labels}</span></div>'
+        )
+
     news_n = len(it.get("news") or [])
+    flag = "🇰🇷" if is_kr else "🇺🇸"
     return (
         '<div style="background:#1E1E2E;border:1px solid #2E2E4E;border-radius:10px;'
         'padding:14px 16px 10px;margin-bottom:4px;">'
         '<div style="display:flex;justify-content:space-between;align-items:center;">'
-        f'<span style="font-size:1.02rem;font-weight:700;color:#E0E0FF">'
+        f'<span style="font-size:1.0rem;font-weight:700;color:#E0E0FF">{flag} '
         f'<a href="{url}" target="_blank" rel="noopener" '
-        f'style="color:#E0E0FF;text-decoration:none;border-bottom:1px dotted #6C6C9C">{t}</a></span>'
+        f'style="color:#E0E0FF;text-decoration:none;border-bottom:1px dotted #6C6C9C">{name}</a>'
+        f'<span style="color:#7A7A9C;font-size:0.74rem;margin-left:6px">{code}</span></span>'
         f'<span style="background:{sc_col};color:#000;font-weight:700;'
         f'padding:2px 10px;border-radius:10px;font-size:0.8rem">{score}</span></div>'
-        '<div style="display:flex;justify-content:space-between;align-items:baseline;margin:6px 0 8px">'
-        f'<span style="font-size:1.18rem;font-weight:700;color:#FFF">${it["price"]:,.2f}</span>'
+        '<div style="display:flex;justify-content:space-between;align-items:baseline;margin:6px 0 6px">'
+        f'<span style="font-size:1.16rem;font-weight:700;color:#FFF">{px_str}</span>'
         f'<span style="font-size:0.88rem;font-weight:600;color:{chg_col}">{chg_str}</span></div>'
+        + ev_html
         + _row("RVOL (상대거래량)", f'{it["rvol"]:.1f}x', it["rvol_col"])
         + _row("RVOL 등급", _html.escape(it["rvol_label"]), it["rvol_col"])
-        + _row("거래량 증가(5/20)", f'{it["vol_inc"]:.1f}x')
+        + _row("거래대금 급증", _html.escape(it["val_label"]))
+        + _row("갭 상승", f'{it["gap"]:+.1f}%')
         + _row("당일 변동률", chg_str, chg_col)
-        + _row("시가총액", _fmt_mcap(it["mcap"]), "#FFD54F")
+        + _row("거래대금", _fmt_value(it), "#FFD54F")
         + _row("뉴스 감성", f'{it["news_score"]}/100 · {news_n}건')
         + '</div>'
     )
 
 
 def render_momentum_tab() -> None:
+    render_session_bar()
     st.markdown("### 🔥 급등주 스캐너")
     st.caption(
-        "큐레이션 소형주 유니버스에서 RVOL·당일 변동률·거래량 증가·뉴스 감성으로 급등 강도를 점수화합니다. "
-        "※ 무료 데이터에 프리마켓 가격이 없어 RVOL+당일 변동률로 대체합니다."
+        "전체 시장에서 RVOL·거래대금 급증·갭·뉴스/특이이벤트로 '급등 직전/초기'를 탐지합니다. "
+        "추세·정배열·패턴은 보지 않습니다. ⚡S급 이벤트(M&A·합병완료·거래재개 등)는 최상단 고정. "
+        "※ 무료 데이터 한계로 프리마켓 가격은 세션 스냅샷(lastsale)으로 대체합니다."
     )
+
+    c1, c2 = st.columns(2)
+    scan_us = c1.checkbox("🇺🇸 미국 전체", value=True, key="mo_us")
+    scan_kr = c2.checkbox("🇰🇷 한국 전체", value=True, key="mo_kr")
     if st.button("🔄 급등주 스캔 새로고침", key="momentum_refresh"):
         scan_momentum.clear()
 
-    with st.spinner("급등주 스캔 중… (큐레이션 유니버스)"):
-        results = scan_momentum()
-
-    if not results:
-        st.info("현재 조건(시총 ≤ $300M · 가격 $0.5~$10)에 맞는 급등 후보가 없습니다.")
+    if not (scan_us or scan_kr):
+        st.info("스캔할 시장을 한 개 이상 선택하세요.")
         return
 
-    st.success(f"급등 후보 {len(results)}종목 (점수 내림차순)")
+    with st.spinner("전체 시장 급등주 스캔 중… (스냅샷 → 강도 압축 → 벌크 분석)"):
+        out = scan_momentum(scan_us=scan_us, scan_kr=scan_kr)
+
+    results = out["results"]
+    render_stage_funnel(out["funnel"], title="단계별 필터 현황", elapsed=out.get("elapsed"))
+
+    if not results:
+        st.info("현재 급등 신호(RVOL·거래대금 급증·갭·이벤트)에 해당하는 후보가 없습니다.")
+        return
+
+    st.success(f"급등 후보 {len(results)}종목 (S급 이벤트 우선 · 점수 내림차순)")
     COLS = 2
     rows = [results[i:i+COLS] for i in range(0, len(results), COLS)]
     for row in rows:

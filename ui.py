@@ -11,7 +11,13 @@ from data_provider import (
     fetch_nasdaq_tickers, fetch_sp500_tickers, fetch_russell2000_tickers,
     fetch_kospi_tickers, fetch_kosdaq_tickers,
     get_kr_meta_dict, get_kr_yf_industry,
+    _build_result, _fetch_us_news, _fetch_naver_news,
 )
+from bulk_data import (
+    fetch_us_snapshot, fetch_us_industry_map, fetch_kr_snapshot,
+    bulk_history,
+)
+from scan_ui import render_stage_funnel, render_session_bar
 from indicators import add_indicators
 from ai_engine import (
     calculate_ai_score, build_research_view,
@@ -521,6 +527,7 @@ def render_full_detail(label: str, data: dict) -> None:
 # Tab 1 — 종목 상세 분석
 # ══════════════════════════════════════════════════════════════════════════════════
 def render_analysis_tab() -> None:
+    render_session_bar()
     st.markdown("#### 종목 코드 또는 이름 입력")
     st.caption("예: `AAPL` · `005930` · `SK하이닉스` · `파두` · `카카오` · `LG전자`")
 
@@ -866,8 +873,11 @@ def _render_scanner_card(item: dict, research: dict | None, tags: list[str]) -> 
     """
     code   = item.get('code', '')
     name   = item.get('name', '')
-    price  = item.get('price', 0) or 0
-    change = item.get('change_pct', 0) or 0
+    # 세션(프리/정규/애프터) 스냅샷 시세 우선, 없으면 일봉 종가로 폴백
+    price  = item.get('session_price') or item.get('price', 0) or 0
+    change = item.get('session_change')
+    if change is None:
+        change = item.get('change_pct', 0) or 0
     spread = item.get('spread', 0) or 0
     score  = int(item.get('score', 0) or 0)
     grade  = item.get('grade', 'D')
@@ -1081,21 +1091,25 @@ def _render_results_grid(enriched: list[tuple]) -> None:
 
 
 def render_scanner_tab() -> None:
-    # Fetch live listings (cached 24 h each, fallback to hardcoded)
-    with st.spinner("시장 종목 목록 로딩 중…"):
-        nasdaq_tickers  = fetch_nasdaq_tickers()
-        sp500_tickers   = fetch_sp500_tickers()
-        russell_tickers = fetch_russell2000_tickers()
-        kospi_tickers   = fetch_kospi_tickers()
-        kosdaq_tickers  = fetch_kosdaq_tickers()
-        kr_meta         = get_kr_meta_dict()
+    # 전체 시장 스냅샷 로딩 (캐시 15분) — 종목당 호출 없이 일괄 수집
+    render_session_bar()
+    with st.spinner("전체 시장 스냅샷 로딩 중…"):
+        us_snap     = fetch_us_snapshot()
+        kospi_snap  = fetch_kr_snapshot("KOSPI")
+        kosdaq_snap = fetch_kr_snapshot("KOSDAQ")
+        kr_meta     = get_kr_meta_dict()
 
-    market_pools: list[tuple[str, str, str, list[str]]] = [
-        ("chk_nasdaq",  "🇺🇸 NASDAQ",       "us", nasdaq_tickers),
-        ("chk_sp500",   "🇺🇸 S&P 500",      "us", sp500_tickers),
-        ("chk_russell", "🇺🇸 Russell 2000",  "us", russell_tickers),
-        ("chk_kospi",   "🇰🇷 KOSPI",         "kr", kospi_tickers),
-        ("chk_kosdaq",  "🇰🇷 KOSDAQ",        "kr", kosdaq_tickers),
+    us_by_exch: dict[str, list[dict]] = {"NASDAQ": [], "NYSE": [], "AMEX": []}
+    for _row in us_snap.values():
+        us_by_exch.setdefault(_row["exchange"], []).append(_row)
+
+    # (체크키, 라벨, 시장, 거래소/마켓키, 스냅샷 rows)
+    market_pools: list[tuple[str, str, str, str, list[dict]]] = [
+        ("chk_nasdaq", "🇺🇸 NASDAQ", "us", "NASDAQ", us_by_exch.get("NASDAQ", [])),
+        ("chk_nyse",   "🇺🇸 NYSE",   "us", "NYSE",   us_by_exch.get("NYSE", [])),
+        ("chk_amex",   "🇺🇸 AMEX",   "us", "AMEX",   us_by_exch.get("AMEX", [])),
+        ("chk_kospi",  "🇰🇷 KOSPI",  "kr", "KOSPI",  list(kospi_snap.values())),
+        ("chk_kosdaq", "🇰🇷 KOSDAQ", "kr", "KOSDAQ", list(kosdaq_snap.values())),
     ]
 
     # ── 결과 필터 session_state 사전 초기화 ─────────────────────────────────
@@ -1113,9 +1127,9 @@ def render_scanner_tab() -> None:
         st.divider()
         st.markdown("### 📊 스캔 대상 시장")
         checks: dict[str, bool] = {}
-        for key, label, _mkt, tickers in market_pools:
+        for key, label, _mkt, _xk, rows in market_pools:
             checks[key] = st.checkbox(
-                f"{label}  ({len(tickers):,}종목)",
+                f"{label}  ({len(rows):,}종목)",
                 value=(key == "chk_nasdaq"),
                 key=key,
             )
@@ -1169,23 +1183,17 @@ def render_scanner_tab() -> None:
             st.session_state.pop("scanner_ran", None)
             st.rerun()
 
-    # Build the combined scan list from checked markets (ETF/SPAC 제외)
-    scan_list: list[tuple[str, str, str]] = []
-    for key, _label, mkt, tickers in market_pools:
-        if checks[key]:
-            if mkt == "kr":
-                scan_list += [
-                    (c, kr_meta.get(c, {}).get('name') or KR_NAMES.get(c, c), mkt)
-                    for c in tickers
-                    if not _is_kr_excluded(
-                        kr_meta.get(c, {}).get('name') or KR_NAMES.get(c, c)
-                    )
-                ]
-            else:
-                scan_list += [(t, t, mkt) for t in tickers]
+    # 선택 시장의 전체 후보 수집 (ETF/거래대금/시총 필터는 깔때기에서 — 탈락 수 집계)
+    candidates: list[tuple[str, str, str, dict]] = []
+    for key, _label, mkt, _xk, rows in market_pools:
+        if not checks[key]:
+            continue
+        for row in rows:
+            code = row["code"] if mkt == "kr" else row["symbol"]
+            candidates.append((code, row.get("name") or code, mkt, row))
 
-    total = len(scan_list)
-    selected_labels = [label for key, label, _m, _t in market_pools if checks[key]]
+    total = len(candidates)
+    selected_labels = [label for key, label, _m, _x, _r in market_pools if checks[key]]
 
     # 스캔 버튼은 항상 표시 — 시장 미선택 시 비활성화
     run_scan = st.button(
@@ -1210,253 +1218,229 @@ def render_scanner_tab() -> None:
         st.session_state["scanner_ran"] = cache_key
         st.session_state.pop("scanner_benchmark", None)
 
-        # ── Stage 1: parallel download + fast MA/spread/volume filter ──
-        stat_box   = st.empty()
+        # ── 깔때기: 스냅샷 사전필터 → 벌크 히스토리 → 정배열/AI 심층 ──
         prog_bar   = st.progress(0.0)
+        funnel_box = st.empty()
         start_time = time.time()
-        completed  = 0
-        stage1_ok: list[tuple[str, str, str, dict]] = []
-        etf_excluded:       int = 0
-        spac_excluded:      int = 0
-        null_count:         int = 0   # 데이터 없음(None) 종목
-        liquidity_excluded: int = 0   # 거래대금 100억원 미만
-        financial_excluded: int = 0   # 금융권(은행·보험·증권·카드·금융서비스) 제외
 
-        _MIN_DAILY_VALUE_KRW = 10_000_000_000   # 100억원
-        _KRW_PER_USD         = 1_350             # USD→KRW 환산 기준
+        _MIN_DAILY_VALUE_KRW = 5_000_000_000    # 50억원 — 평균 거래대금 최소 기준 (미만이면 제외)
+        _KRW_PER_USD         = 1_350            # USD→KRW 환산 기준
 
-        def _dl(item: tuple[str, str, str]) -> tuple[str, str, str, dict | None]:
-            code, name, mkt = item
-            return code, name, mkt, get_data(code, mkt)
+        c_total  = len(candidates)
+        c_etf = c_spac = c_liq = c_nodata = c_trend = c_fin = c_fail = 0
 
-        # 스캐너 멈춤 방지 워치독: 워커가 네트워크 호출(yfinance .info / 번역 등)에서
-        # 무기한 블로킹되면 future 가 완료되지 않아 기존 as_completed 가 끝까지 대기 →
-        # 4136/4146 부근에서 영구 정지했다. 진척이 멈추면(스톨) 막힌 잔여 종목을 건너뛰어
-        # 어떤 종목이 막혀도 스캔이 항상 종료되도록 보장한다.
-        STALL_SKIP_SEC   = 3.0    # 막판 3초간 완료 0건 → 잔여(막힌) 종목 스킵
-        GLOBAL_STALL_SEC = 20.0   # 대량 정지(네트워크 장애 등) 대비 전역 백스톱
-        TAIL_PENDING     = 60     # 잔여가 이 이하일 때 3초 워치독 가동
+        # US 업종 맵 (금융 필터/테마용, 24h 캐시, 비치명적). US 미선택 시 생략.
+        _need_us = any(m == 'us' for (_c, _n, m, _s) in candidates)
+        us_ind   = fetch_us_industry_map() if _need_us else {}
 
-        exc = None
-        last_ticker = '—'
-        try:
-            exc = ThreadPoolExecutor(max_workers=20)
-            futures = {exc.submit(_dl, item): item for item in scan_list}
-            pending = set(futures)
-            last_completion = time.time()
-            while pending:
-                done_now = [f for f in pending if f.done()]
-                if not done_now:
-                    # 한 건도 완료되지 않음 → 스톨 워치독 검사
-                    stalled = time.time() - last_completion
-                    if pending and (
-                        (len(pending) <= TAIL_PENDING and stalled > STALL_SKIP_SEC)
-                        or stalled > GLOBAL_STALL_SEC
-                    ):
-                        stuck  = [futures[f] for f in pending]
-                        labels = ', '.join(
-                            f"{(it[1] or it[0])}({it[0]}/{it[2]})" for it in stuck[:10])
-                        print(
-                            f"[scanner] STALL {stalled:.1f}s — last_processed='{last_ticker}'; "
-                            f"skipping {len(stuck)} stuck ticker(s): {labels}"
-                            f"{' …' if len(stuck) > 10 else ''}",
-                            flush=True,
-                        )
-                        for f in pending:
-                            f.cancel()
-                        completed  += len(stuck)
-                        null_count += len(stuck)
-                        pending.clear()
-                        break
-                    time.sleep(0.05)
-                    continue
-
-                last_completion = time.time()
-                for fut in done_now:
-                    pending.discard(fut)
-                    _item = futures[fut]
-                    last_ticker = f"{(_item[1] or _item[0])}({_item[0]}/{_item[2]})"
-                    completed += 1
-                    if completed % 500 == 0:
-                        print(f"[scanner] …{completed}/{total} last='{last_ticker}'",
-                              flush=True)
-                    code = name = mkt = ''
-                    raw: dict | None = None
-
-                    # ① future 결과 수거 — 예외 독립 처리 (한 종목 실패가 전체를 막지 않음)
-                    try:
-                        code, name, mkt, raw = fut.result(timeout=0)
-                    except Exception:
-                        pass   # raw stays None → counted as null below
-
-                    # ② raw 데이터 없음 → 카운트 후 스킵
-                    if raw is None:
-                        null_count += 1
-                    else:
-                        # ③ US 종목: ETF/SPAC 판별 (예외 안전 처리)
-                        _excl = False
-                        if mkt == 'us':
-                            try:
-                                _excl_flag, _reason = _is_etf_or_spac(raw)
-                            except Exception:
-                                _excl_flag, _reason = False, ''
-                            if _excl_flag:
-                                if _reason == 'ETF':
-                                    etf_excluded += 1
-                                else:
-                                    spac_excluded += 1
-                                _excl = True
-
-                        # ④ 거래대금 필터 (100억원 미만 제외)
-                        if not _excl:
-                            try:
-                                hist_liq = raw.get('hist')
-                                if hist_liq is not None and len(hist_liq) >= 5:
-                                    tail5   = hist_liq.tail(5)
-                                    avg_val = float((tail5['Close'] * tail5['Volume']).mean())
-                                else:
-                                    avg_val = 0.0
-                                val_krw = avg_val * _KRW_PER_USD if mkt == 'us' else avg_val
-                                if val_krw < _MIN_DAILY_VALUE_KRW:
-                                    liquidity_excluded += 1
-                                    _excl = True
-                            except Exception:
-                                pass   # 거래대금 계산 실패 시 필터 미적용
-
-                        # ⑤ Stage 1 통과 여부 (ETF/SPAC/유동성 미제외 종목만)
-                        if not _excl:
-                            try:
-                                if _stage1_pass(raw):
-                                    stage1_ok.append((code, name, mkt, raw))
-                            except Exception:
-                                pass
-
-                    # ⑤ 진행 상황 업데이트 (모든 종목에 대해 항상 실행)
-                    elapsed = time.time() - start_time
-                    rate    = completed / elapsed if elapsed > 0 else 0.0
-                    eta_s   = (total - completed) / rate if rate > 0 else 0.0
-                    eta_str = (f"{int(eta_s//60)}분 {int(eta_s%60)}초"
-                               if eta_s >= 60 else f"{int(eta_s)}초")
-                    try:
-                        prog_bar.progress(completed / total)
-                        stat_box.markdown(
-                            f"**1단계** 데이터 로드 &nbsp;·&nbsp; "
-                            f"`{completed:,} / {total:,}` &nbsp;·&nbsp; "
-                            f"ETF제외 **{etf_excluded}** · SPAC제외 **{spac_excluded}** · "
-                            f"거래대금제외 **{liquidity_excluded}** · "
-                            f"데이터없음 **{null_count}** · 통과 **{len(stage1_ok)}** &nbsp;·&nbsp; "
-                            f"**{rate:.1f} 종목/초** &nbsp;·&nbsp; 남은시간 **{eta_str}**"
-                        )
-                    except Exception:
-                        pass
-        except Exception as e:
-            stat_box.error(f"1단계 오류: {e}")
+        def _interim(stage_label):
             try:
-                prog_bar.empty()
+                render_stage_funnel(
+                    [
+                        ("총 스캔",          c_total,  "total"),
+                        ("ETF/SPAC 제외",    c_etf + c_spac, "reject"),
+                        ("거래대금 제외",     c_liq,   "reject"),
+                        ("데이터 없음",       c_nodata,"reject"),
+                        ("추세(정배열) 제외", c_trend, "reject"),
+                        ("금융 제외",         c_fin,   "reject"),
+                        (stage_label,        len(prelim), "info"),
+                    ],
+                    title="단계별 필터 현황 (진행 중)",
+                    container=funnel_box,
+                )
             except Exception:
                 pass
-            return
-        finally:
-            # 멈춘 워커가 있어도 셧다운에서 대기하지 않음 → with 블록 hang 방지.
-            if exc is not None:
-                exc.shutdown(wait=False, cancel_futures=True)
-        print(
-            f"[scanner] Stage1 완료: {completed}/{total} 처리 · 통과 {len(stage1_ok)} · "
-            f"데이터없음 {null_count} · last_processed='{last_ticker}'",
-            flush=True,
-        )
 
-        # ── Stage 2: full indicators + AI score on survivors only ──────
-        results: list[dict] = []
-        with_patterns: int  = 0   # 패턴 1개 이상 감지 종목 수
-        s2_total = len(stage1_ok)
-        for i, (code, name, mkt, raw) in enumerate(stage1_ok):
-            try:
-                pct = (i + 1) / s2_total if s2_total > 0 else 1.0
+        # ── Stage A: 스냅샷 사전필터 (ETF/SPAC · KR 거래대금 · US 시총 프록시) ──
+        prelim: list[tuple[str, str, str, dict]] = []
+        for code, name, mkt, snap in candidates:
+            if mkt == 'us':
                 try:
-                    prog_bar.progress(pct)
-                    stat_box.markdown(
-                        f"**2단계** 심층 분석 &nbsp;·&nbsp; "
-                        f"`{i+1} / {s2_total}` &nbsp;·&nbsp; {name} &nbsp;·&nbsp; "
-                        f"패턴감지 **{with_patterns}**"
-                    )
+                    excl, reason = _is_etf_or_spac({
+                        'company_name': name,
+                        'industry':     us_ind.get(code, ''),
+                        'quote_type':   'EQUITY',
+                    })
                 except Exception:
-                    pass
+                    excl, reason = False, ''
+                if excl:
+                    if reason == 'ETF':
+                        c_etf += 1
+                    else:
+                        c_spac += 1
+                    continue
+                # 시가총액으로는 제외하지 않음 — US 거래대금은 Stage C에서 히스토리로 계산해 필터.
+            else:  # kr
+                if _is_kr_excluded(name):
+                    c_etf += 1
+                    continue
+                if (snap.get('amount') or 0.0) < _MIN_DAILY_VALUE_KRW:
+                    c_liq += 1
+                    continue
+            prelim.append((code, name, mkt, snap))
+
+        _interim("심층 후보")
+
+        # ── Stage B: 벌크 히스토리 다운로드 (시장별, ~10종목/초) ──
+        us_codes = [c for c, _n, m, _s in prelim if m == 'us']
+        kr_codes = [c for c, _n, m, _s in prelim if m == 'kr']
+        kr_suffix = {c: ('KS' if (s.get('market') == 'KOSPI') else 'KQ')
+                     for c, _n, m, s in prelim if m == 'kr'}
+
+        hist_map: dict[str, pd.DataFrame] = {}
+
+        def _prog_dl(done, tot, base, span):
+            try:
+                prog_bar.progress(min(base + span * done / max(tot, 1), 1.0))
+            except Exception:
+                pass
+
+        try:
+            if us_codes:
+                hist_map.update(bulk_history(
+                    us_codes, 'us',
+                    progress=lambda d, t: _prog_dl(d, t, 0.0, 0.55 if kr_codes else 1.0),
+                ))
+            if kr_codes:
+                hist_map.update(bulk_history(
+                    kr_codes, 'kr', kr_suffix=kr_suffix,
+                    progress=lambda d, t: _prog_dl(d, t, 0.55 if us_codes else 0.0,
+                                                   0.45 if us_codes else 1.0),
+                ))
+        except Exception as e:
+            funnel_box.error(f"히스토리 다운로드 오류: {e}")
+
+        survivors = [(c, n, m, s) for c, n, m, s in prelim if c in hist_map]
+        c_nodata  = len(prelim) - len(survivors)
+
+        # ── Stage C: _build_result → 거래대금(US) → 정배열 → AI 심층 분석 ──
+        results: list[dict] = []
+        with_patterns = 0
+        s2_total = len(survivors)
+        for i, (code, name, mkt, snap) in enumerate(survivors):
+            try:
+                if i % 50 == 0:
+                    _interim("심층 분석 중")
+                hist = hist_map.get(code)
+                raw  = _build_result(hist, [])   # 뉴스는 최종 통과 종목만 나중에 수집
+                if raw is None:
+                    c_nodata += 1
+                    continue
+                # US 거래대금 필터 (스냅샷에 거래량이 없어 히스토리로 계산)
+                if mkt == 'us':
+                    if len(hist) >= 5:
+                        t5 = hist.tail(5)
+                        avg_val = float((t5['Close'] * t5['Volume']).mean())
+                    else:
+                        avg_val = 0.0
+                    if avg_val * _KRW_PER_USD < _MIN_DAILY_VALUE_KRW:
+                        c_liq += 1
+                        continue
+                # 추세(정배열 MA20>MA60>MA120) 필터
+                if not _stage1_pass(raw):
+                    c_trend += 1
+                    continue
+                # 메타 부여
+                _m = kr_meta.get(code, {}) if mkt == 'kr' else {}
+                raw['company_name'] = name
+                if mkt == 'us':
+                    raw['sector']   = ''
+                    raw['industry'] = us_ind.get(code, '')
+                else:
+                    raw['sector']   = _m.get('market', '')
+                    raw['industry'] = _m.get('industry', '')
+
                 data   = add_indicators(raw)
                 scored = calculate_ai_score(data)
-                # 패턴 1개 이상 감지 여부 카운트 (bottom_setup 은 dict 이므로 제외)
                 if any(isinstance(v, (tuple, list)) and v and v[0]
                        for v in scored.get('patterns', {}).values()):
                     with_patterns += 1
-                mom    = _calc_momentum(raw['hist'])
-                _m = kr_meta.get(code, {}) if mkt == 'kr' else {}
-                # KR Phase-2 stocks: fetch Yahoo Finance industry (small set, cached)
-                if mkt == 'kr' and not data.get('industry'):
-                    _ind = get_kr_yf_industry(code, _m.get('market', ''))
-                    data = {**data, 'industry': _ind}
-                # 금융권(은행·보험·증권·카드·금융서비스) 제외
+                # 금융권 제외
                 if _is_financial(data.get('sector', ''), data.get('industry', '')):
-                    financial_excluded += 1
+                    c_fin += 1
                     continue
-                # 거래대금 계산 (카드 표시용, 5일 평균)
-                try:
-                    _hist_tv = raw.get('hist')
-                    if _hist_tv is not None and len(_hist_tv) >= 5:
-                        _tv_raw = float(
-                            (_hist_tv['Close'].tail(5) * _hist_tv['Volume'].tail(5)).mean()
-                        )
-                    else:
-                        _tv_raw = 0.0
-                except Exception:
-                    _tv_raw = 0.0
-
+                mom = _calc_momentum(hist)
+                if len(hist) >= 5:
+                    t5 = hist.tail(5)
+                    tv = float((t5['Close'] * t5['Volume']).mean())
+                else:
+                    tv = 0.0
                 item = {
                     'code': code, 'name': name, 'market': mkt,
-                    'momentum':       mom,
-                    'kr_market':      _m.get('market', ''),
-                    'kr_industry':    _m.get('industry', ''),
-                    'trading_value':  _tv_raw,   # 로컬 통화 (KRW or USD)
+                    'momentum':        mom,
+                    'kr_market':       _m.get('market', ''),
+                    'kr_industry':     _m.get('industry', ''),
+                    'trading_value':   tv,
+                    'session_price':   snap.get('price'),
+                    'session_change':  snap.get('change_pct'),
                     **data, **scored,
                 }
-                # 연구뷰(R/R 등) 계산. R/R<1 도 제외하지 않고 관찰리스트로 결과에 포함한다.
-                # 연구뷰 계산 자체가 실패하면 액션을 확정할 수 없으므로 fail-closed 로 제외.
                 try:
-                    _rv = build_research_view(item, item)
+                    item['_research'] = build_research_view(item, item)
                 except Exception:
+                    c_fail += 1
                     continue
-                item['_research'] = _rv
                 results.append(item)
             except Exception:
+                c_fail += 1
                 continue
 
-        # ── Benchmark ──────────────────────────────────────────────────
+        # ── 뉴스 수집: 최종 결과 상위 ~100종목만 (속도 보존) ──
+        results.sort(key=lambda x: (x.get('ma300_strategy', False),
+                                    x.get('score', 0)), reverse=True)
+
+        def _fetch_news_for(it):
+            try:
+                if it['market'] == 'us':
+                    return it['code'], _fetch_us_news(it['code'])
+                return it['code'], _fetch_naver_news(it['code'])
+            except Exception:
+                return it['code'], []
+
+        news_targets = results[:100]
+        if news_targets:
+            try:
+                with ThreadPoolExecutor(max_workers=16) as _nx:
+                    news_map = dict(_nx.map(_fetch_news_for, news_targets))
+            except Exception:
+                news_map = {}
+            for it in results:
+                it['news'] = news_map.get(it['code'], [])
+        else:
+            for it in results:
+                it.setdefault('news', [])
+
         total_elapsed = time.time() - start_time
-        avg_rate      = total / total_elapsed if total_elapsed > 0 else 0.0
-        benchmark     = {
-            'total': total, 'elapsed': total_elapsed, 'rate': avg_rate,
-            'etf_excluded': etf_excluded, 'spac_excluded': spac_excluded,
-            'liquidity_excluded': liquidity_excluded,
-            'financial_excluded': financial_excluded,
-            'null_count': null_count,
-            'stage1_pass': len(stage1_ok), 'stage2_pass': len(results),
-            'with_patterns': with_patterns,
-        }
         try:
             prog_bar.empty()
-            stat_box.success(
-                f"✅ 스캔 완료 &nbsp;·&nbsp; **{total:,}종목 / {total_elapsed:.1f}초** "
-                f"&nbsp;·&nbsp; ETF제외 **{etf_excluded}** · SPAC제외 **{spac_excluded}** "
-                f"· 거래대금제외 **{liquidity_excluded}** · 금융제외 **{financial_excluded}** "
-                f"· 데이터없음 **{null_count}** "
-                f"&nbsp;·&nbsp; 1단계 통과 **{len(stage1_ok)}** "
-                f"&nbsp;·&nbsp; 최종 결과 **{len(results)}**"
-            )
         except Exception:
             pass
 
-        results.sort(key=lambda x: (x.get('ma300_strategy', False), x.get('score', 0)), reverse=True)
+        funnel_stages = [
+            ("총 스캔",            c_total,        "total"),
+            ("ETF/SPAC 제외",      c_etf + c_spac, "reject"),
+            ("거래대금 제외",       c_liq,          "reject"),
+            ("데이터 없음",         c_nodata,       "reject"),
+            ("추세(정배열) 제외",   c_trend,        "reject"),
+            ("금융 제외",           c_fin,          "reject"),
+            ("분석 실패 제외",      c_fail,         "reject"),
+            ("최종 통과",           len(results),   "pass"),
+        ]
+        funnel_box.empty()
+
+        benchmark = {
+            'total': c_total, 'elapsed': total_elapsed,
+            'etf_excluded': c_etf, 'spac_excluded': c_spac,
+            'liquidity_excluded': c_liq,
+            'null_count': c_nodata, 'trend_excluded': c_trend,
+            'financial_excluded': c_fin, 'fail_excluded': c_fail,
+            'stage2_pass': len(results), 'with_patterns': with_patterns,
+        }
+
         results = _dedup_by_ticker(results)
         st.session_state["scanner_results"]   = results
+        st.session_state["scanner_funnel"]    = funnel_stages
+        st.session_state["scanner_funnel_elapsed"] = total_elapsed
         st.session_state["scanner_benchmark"] = benchmark
     else:
         results = st.session_state.get("scanner_results", [])
@@ -1477,28 +1461,13 @@ def render_scanner_tab() -> None:
         and _match_pattern_filter(r, pattern_sel)
     ]
 
-    if benchmark:
-        b1, b2, b3, b4, b5, b6, b7, b8 = st.columns(8)
-        _etf  = benchmark.get('etf_excluded', 0)
-        _spac = benchmark.get('spac_excluded', 0)
-        _liq  = benchmark.get('liquidity_excluded', 0)
-        _null = benchmark.get('null_count', 0)
-        _wpat = benchmark.get('with_patterns', 0)
-        _s2   = benchmark.get('stage2_pass', 0)
-        _analyzed = benchmark['total'] - _etf - _spac - _liq - _null
-        b1.metric("전체 종목",     f"{benchmark['total']:,}")
-        b2.metric("SPAC 제외",     f"{_spac}개")
-        b3.metric("거래대금 제외", f"{_liq}개",  help="5일 평균 일 거래대금 100억원 미만 제외")
-        b4.metric("분석 대상",     f"{max(_analyzed, 0):,}개")
-        b5.metric("소요 시간",     f"{benchmark['elapsed']:.1f}초")
-        b6.metric("최종 통과",     f"{_s2}종목")
-        b7.metric("패턴 감지",     f"{_wpat}종목", delta=f"/{_s2}종목 중")
-        b8.metric("ETF 제외",      f"{_etf}개", help="NASDAQ 소스는 ETF 미포함. S&P500/Russell 스캔 시 ETF가 탐지됩니다.")
-    else:
-        m1, m2, m3 = st.columns(3)
-        m1.metric("스캔",        f"{total:,}종목")
-        m2.metric("필터 통과",   f"{len(results)}종목")
-        m3.metric("분석 대상", f"{len(results)}종목")
+    _funnel = st.session_state.get("scanner_funnel")
+    if _funnel:
+        render_stage_funnel(
+            _funnel,
+            title="단계별 필터 현황",
+            elapsed=st.session_state.get("scanner_funnel_elapsed"),
+        )
     st.divider()
 
     # ── 검색 결과 헤더 ──────────────────────────────────────────────────────────
