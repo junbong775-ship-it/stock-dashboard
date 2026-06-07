@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import time
 import math
+import gc
 import html as _html
 from safe_exec import gather_parallel
 
@@ -1229,6 +1230,10 @@ def render_scanner_tab() -> None:
         c_total  = len(candidates)
         c_etf = c_spac = c_liq = c_nodata = c_trend = c_fin = c_fail = 0
 
+        # 단계별 소요 시간 측정용 (속도 진단).
+        stage_t: dict[str, float] = {}
+        _t_a0 = time.time()
+
         # US 업종 맵 (금융 필터/테마용, 24h 캐시, 비치명적). US 미선택 시 생략.
         _need_us = any(m == 'us' for (_c, _n, m, _s) in candidates)
         us_ind   = fetch_us_industry_map() if _need_us else {}
@@ -1279,6 +1284,8 @@ def render_scanner_tab() -> None:
                     continue
             prelim.append((code, name, mkt, snap))
 
+        stage_t['스냅샷·사전필터'] = time.time() - _t_a0
+        _t_b0 = time.time()
         _interim("심층 후보")
 
         # ── Stage B: 벌크 히스토리 다운로드 (시장별, ~10종목/초) ──
@@ -1312,6 +1319,9 @@ def render_scanner_tab() -> None:
 
         survivors = [(c, n, m, s) for c, n, m, s in prelim if c in hist_map]
         c_nodata  = len(prelim) - len(survivors)
+
+        stage_t['히스토리 다운로드'] = time.time() - _t_b0
+        _t_c0 = time.time()
 
         # ── Stage C: _build_result → 거래대금(US) → 정배열 → AI 심층 분석 ──
         results: list[dict] = []
@@ -1385,6 +1395,13 @@ def render_scanner_tab() -> None:
                 c_fail += 1
                 continue
 
+        stage_t['심층 분석'] = time.time() - _t_c0
+        _t_n0 = time.time()
+
+        # 메모리 정리: 히스토리 맵은 분석이 끝나면 더 필요 없다 → 즉시 해제.
+        hist_map.clear()
+        gc.collect()
+
         # ── 뉴스 수집: 최종 결과 상위 ~100종목만 (속도 보존) ──
         results.sort(key=lambda x: (x.get('ma300_strategy', False),
                                     x.get('score', 0)), reverse=True)
@@ -1411,7 +1428,9 @@ def render_scanner_tab() -> None:
             for it in results:
                 it.setdefault('news', [])
 
+        stage_t['뉴스 수집'] = time.time() - _t_n0
         total_elapsed = time.time() - start_time
+        gc.collect()
         try:
             prog_bar.empty()
         except Exception:
@@ -1436,6 +1455,7 @@ def render_scanner_tab() -> None:
             'null_count': c_nodata, 'trend_excluded': c_trend,
             'financial_excluded': c_fin, 'fail_excluded': c_fail,
             'stage2_pass': len(results), 'with_patterns': with_patterns,
+            'stage_times': stage_t,
         }
 
         results = _dedup_by_ticker(results)
@@ -1469,6 +1489,11 @@ def render_scanner_tab() -> None:
             title="단계별 필터 현황",
             elapsed=st.session_state.get("scanner_funnel_elapsed"),
         )
+    _bench = st.session_state.get("scanner_benchmark") or {}
+    _stimes = _bench.get("stage_times") or {}
+    if _stimes:
+        _parts = "  ·  ".join(f"{k} {v:.1f}s" for k, v in _stimes.items())
+        st.caption(f"⏱️ 단계별 소요: {_parts}  ·  합계 {_bench.get('elapsed', 0):.1f}s")
     st.divider()
 
     # ── 검색 결과 헤더 ──────────────────────────────────────────────────────────

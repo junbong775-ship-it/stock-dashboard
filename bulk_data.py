@@ -177,6 +177,52 @@ def _yf_symbol(code: str, market: str, kr_suffix: dict[str, str] | None = None) 
     return code.upper().replace(".", "-")
 
 
+class _ChunkFetchError(Exception):
+    """청크 다운로드 전체 실패/공백 — 캐시에 저장하지 않기 위한 신호."""
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def _download_chunk(syms: tuple[str, ...], period: str) -> dict[str, pd.DataFrame]:
+    """한 청크(야후 심볼 튜플)를 다운로드해 {심볼: 정제된 OHLCV} 로 반환.
+
+    동일 청크(같은 심볼 집합·period)가 다시 요청되면 @st.cache_data(15분)가
+    네트워크 호출 없이 즉시 반환한다 → 반복 스캔/시장 재선택 시 다운로드 생략.
+    반환 데이터는 비캐시 경로와 100% 동일(같은 컬럼·dropna·len>=20 기준).
+
+    **일시적 전체 실패(네트워크 오류/빈 응답/전 종목 누락)는 `_ChunkFetchError`로
+    올려 캐시 저장을 막는다** — st.cache_data 는 예외를 캐시하지 않으므로, 비캐시
+    경로처럼 다음 스캔에서 자동 재시도된다(일시 실패가 15분 고정되어 결과가 바뀌는
+    것을 방지)."""
+    try:
+        df = yf.download(
+            list(syms), period=period, group_by="ticker",
+            threads=True, progress=False, auto_adjust=True,
+        )
+    except Exception as e:
+        raise _ChunkFetchError(str(e))
+    if df is None or df.empty:
+        raise _ChunkFetchError("empty response")
+    multi = isinstance(df.columns, pd.MultiIndex)
+    res: dict[str, pd.DataFrame] = {}
+    for sym in syms:
+        try:
+            if multi:
+                if sym not in df.columns.get_level_values(0):
+                    continue
+                sub = df[sym]
+            else:
+                sub = df  # 단일 종목 배치
+            sub = sub[["Open", "High", "Low", "Close", "Volume"]].dropna()
+            if len(sub) >= 20:
+                res[sym] = sub
+        except Exception:
+            continue
+    if not res:
+        # df 는 왔지만 유효 종목이 0 → 일시 이상으로 보고 캐시하지 않음.
+        raise _ChunkFetchError("no valid symbols")
+    return res
+
+
 def bulk_history(
     tickers: list[str],
     market: str,
@@ -188,6 +234,9 @@ def bulk_history(
     """청크 벌크 다운로드. 내부 코드 → OHLCV DataFrame 맵 반환(빈/실패 종목은 누락).
 
     progress(done, total) 콜백으로 진척을 보고한다(UI 진행바용). ~10종목/초.
+    다운로드는 야후 서버측 상한(~10~12종목/초, IP당)에 막혀 동시성을 올려도
+    빨라지지 않으므로 순차 청크가 가장 빠르다. 대신 청크 단위 캐시(`_download_chunk`)로
+    반복 스캔 비용을 제거한다.
     """
     out: dict[str, pd.DataFrame] = {}
     uniq: list[str] = list(dict.fromkeys(t for t in tickers if t))
@@ -204,28 +253,14 @@ def bulk_history(
     for i in range(0, len(syms), chunk):
         batch = syms[i:i + chunk]
         try:
-            df = yf.download(
-                batch, period=period, group_by="ticker",
-                threads=True, progress=False, auto_adjust=True,
-            )
-        except Exception:
-            df = None
-        if df is not None and not df.empty:
-            multi = isinstance(df.columns, pd.MultiIndex)
-            for sym in batch:
-                code = sym_to_code[sym]
-                try:
-                    if multi:
-                        if sym not in df.columns.get_level_values(0):
-                            continue
-                        sub = df[sym]
-                    else:
-                        sub = df  # 단일 종목 배치
-                    sub = sub[["Open", "High", "Low", "Close", "Volume"]].dropna()
-                    if len(sub) >= 20:
-                        out[code] = sub
-                except Exception:
-                    continue
+            chunk_res = _download_chunk(tuple(batch), period)
+        except _ChunkFetchError:
+            # 일시적 청크 실패 — 캐시되지 않았으므로 다음 스캔에서 재시도된다.
+            chunk_res = {}
+        for sym, sub in chunk_res.items():
+            code = sym_to_code.get(sym)
+            if code is not None:
+                out[code] = sub
         done += len(batch)
         if progress is not None:
             try:
