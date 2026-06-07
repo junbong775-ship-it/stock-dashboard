@@ -3,7 +3,7 @@ import pandas as pd
 import time
 import math
 import html as _html
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from safe_exec import gather_parallel
 
 from data_provider import (
     get_krx_listing, has_korean, resolve_input,
@@ -1399,11 +1399,12 @@ def render_scanner_tab() -> None:
 
         news_targets = results[:100]
         if news_targets:
-            try:
-                with ThreadPoolExecutor(max_workers=16) as _nx:
-                    news_map = dict(_nx.map(_fetch_news_for, news_targets))
-            except Exception:
-                news_map = {}
+            # 안전 병렬: 전체 마감시한 + shutdown(wait=False)로 무한 로딩/멈춤 방지.
+            news_map = {}
+            for _it, pair in gather_parallel(_fetch_news_for, news_targets,
+                                             max_workers=8, deadline_sec=45.0):
+                if pair:
+                    news_map[pair[0]] = pair[1]
             for it in results:
                 it['news'] = news_map.get(it['code'], [])
         else:

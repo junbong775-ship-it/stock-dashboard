@@ -10,9 +10,9 @@ from __future__ import annotations
 import streamlit as st
 import yfinance as yf
 import html as _html
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import news_sentiment as _sent
+from safe_exec import gather_parallel
 from data_provider import _fetch_us_news, _session_quote
 from news_view import render_news_section
 from scan_ui import render_session_bar
@@ -169,13 +169,12 @@ def scan_growth() -> list[dict]:
                 seen.add(t)
                 universe.append(t)
 
+    # 안전 병렬: yfinance .info 가 hang-prone 이므로 전체 마감시한으로 보호한다.
     out: list[dict] = []
-    with ThreadPoolExecutor(max_workers=10) as ex:
-        futs = {ex.submit(_scan_one, t): t for t in universe}
-        for f in as_completed(futs):
-            r = f.result()
-            if r:
-                out.append(r)
+    for _t, r in gather_parallel(_scan_one, universe,
+                                 max_workers=8, deadline_sec=60.0):
+        if r:
+            out.append(r)
     out.sort(key=lambda d: d["score"], reverse=True)
     return out
 
@@ -289,5 +288,8 @@ def render_growth_tab() -> None:
                     st.warning("이 종목 카드를 표시할 수 없습니다.")
                 news = it.get("news") or []
                 if news:
-                    with st.expander(f"📰 뉴스 {len(news)}건 (한국어)", expanded=False):
-                        render_news_section(news, key_prefix="gr", show_overall=False)
+                    try:
+                        with st.expander(f"📰 뉴스 {len(news)}건 (한국어)", expanded=False):
+                            render_news_section(news, key_prefix="gr", show_overall=False)
+                    except Exception:
+                        pass

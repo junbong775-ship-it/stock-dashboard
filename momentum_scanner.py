@@ -10,17 +10,18 @@ S급 이벤트(M&A·SPAC 합병완료·거래정지 후 재개·티커변경 등
 """
 from __future__ import annotations
 
+import gc
 import time
 import streamlit as st
 import pandas as pd
 import html as _html
-from concurrent.futures import ThreadPoolExecutor
 
 import news_sentiment as _sent
 from data_provider import _fetch_us_news, _fetch_naver_news
 from bulk_data import (
     fetch_us_snapshot, fetch_kr_snapshot, fetch_us_industry_map, bulk_history,
 )
+from safe_exec import gather_parallel
 from scan_ui import render_stage_funnel, render_session_bar
 from news_view import render_news_section
 # ETF/SPAC·한국 제외 판정은 메인 스캐너와 동일 규칙을 재사용한다.
@@ -30,6 +31,8 @@ from ui import _is_etf_or_spac, _is_kr_excluded
 _US_CAP = 250
 _KR_CAP = 150
 _KRW_PER_USD = 1_350
+# 뉴스 수집 상한 — 신호 후보가 많아도 메모리/시간을 묶어 Cloud에서 안정 동작.
+_NEWS_CAP = 80
 
 
 def _rvol_tier(rvol: float) -> tuple[int, str, str]:
@@ -110,8 +113,33 @@ def _score_one(snap: dict, hist: pd.DataFrame, market: str) -> dict | None:
         return None
 
 
-@st.cache_data(ttl=300, show_spinner=False)
 def scan_momentum(scan_us: bool = True, scan_kr: bool = True) -> dict:
+    """전체 시장 급등 후보 스캔(공개 진입점).
+
+    실제 계산은 캐시되는 `_scan_momentum_cached`가 수행한다. 예외가 나면 그 결과를
+    캐시에 남기지 않고(클리어) 안전한 빈 결과 + error 메시지를 돌려준다 — 일시적
+    장애가 5분 캐시에 '고착'되어 앱이 계속 죽는 것을 막는다.
+    """
+    try:
+        return _scan_momentum_cached(scan_us=scan_us, scan_kr=scan_kr)
+    except Exception as e:  # noqa: BLE001
+        try:
+            _scan_momentum_cached.clear()
+        except Exception:
+            pass
+        return {"results": [], "funnel": [], "elapsed": 0.0, "error": str(e)}
+
+
+def clear_cache() -> None:
+    """급등주 스캔 캐시를 비운다(새로고침 버튼용)."""
+    try:
+        _scan_momentum_cached.clear()
+    except Exception:
+        pass
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _scan_momentum_cached(scan_us: bool = True, scan_kr: bool = True) -> dict:
     """전체 시장 급등 후보 스캔. 결과 + 단계별 탈락 집계를 반환한다."""
     t0 = time.time()
     c_total = c_etf = c_reduced = c_nodata = c_nosignal = 0
@@ -174,6 +202,10 @@ def scan_momentum(scan_us: bool = True, scan_kr: bool = True) -> dict:
         base["name"] = row.get("name", key)
         scored.append(base)
 
+    # 히스토리는 점수 계산 후 더 쓰지 않으므로 즉시 해제(Cloud 메모리 절약).
+    hist_map.clear()
+    gc.collect()
+
     # 뉴스/이벤트는 1차 신호 통과 후보에만 (속도 보존)
     def _has_signal(it: dict) -> bool:
         return (it["rvol"] >= 1.5 or it["val_ratio"] >= 2.0
@@ -181,6 +213,12 @@ def scan_momentum(scan_us: bool = True, scan_kr: bool = True) -> dict:
 
     signal_cands = [it for it in scored if _has_signal(it)]
     c_nosignal = len(scored) - len(signal_cands)
+
+    # 신호 후보가 아주 많아도 뉴스 수집을 상한으로 묶는다(강도 상위 우선).
+    def _strength(it: dict) -> float:
+        return it["rvol"] + it["val_ratio"] + it["intraday"] / 5.0 + it["gap"] / 5.0
+
+    news_cands = sorted(signal_cands, key=_strength, reverse=True)[:_NEWS_CAP]
 
     def _news_for(it: dict):
         try:
@@ -190,13 +228,12 @@ def scan_momentum(scan_us: bool = True, scan_kr: bool = True) -> dict:
         except Exception:
             return it["code"], []
 
+    # 안전 병렬: 전체 마감시한 + shutdown(wait=False)로 무한 로딩/멈춤 방지.
     news_map: dict[str, list] = {}
-    if signal_cands:
-        try:
-            with ThreadPoolExecutor(max_workers=16) as nx:
-                news_map = dict(nx.map(_news_for, signal_cands))
-        except Exception:
-            news_map = {}
+    for _it, pair in gather_parallel(_news_for, news_cands,
+                                     max_workers=8, deadline_sec=40.0):
+        if pair:
+            news_map[pair[0]] = pair[1]
 
     results: list[dict] = []
     for it in signal_cands:
@@ -236,7 +273,8 @@ def scan_momentum(scan_us: bool = True, scan_kr: bool = True) -> dict:
         ("급등 신호 없음",   c_nosignal,        "reject"),
         ("급등 후보",        len(results),      "pass"),
     ]
-    return {"results": results, "funnel": funnel, "elapsed": time.time() - t0}
+    return {"results": results, "funnel": funnel,
+            "elapsed": time.time() - t0, "error": None}
 
 
 def _fmt_value(it: dict) -> str:
@@ -323,17 +361,27 @@ def render_momentum_tab() -> None:
     scan_us = c1.checkbox("🇺🇸 미국 전체", value=True, key="mo_us")
     scan_kr = c2.checkbox("🇰🇷 한국 전체", value=True, key="mo_kr")
     if st.button("🔄 급등주 스캔 새로고침", key="momentum_refresh"):
-        scan_momentum.clear()
+        clear_cache()
 
     if not (scan_us or scan_kr):
         st.info("스캔할 시장을 한 개 이상 선택하세요.")
         return
 
-    with st.spinner("전체 시장 급등주 스캔 중… (스냅샷 → 강도 압축 → 벌크 분석)"):
-        out = scan_momentum(scan_us=scan_us, scan_kr=scan_kr)
+    # 스캔/렌더 전체를 보호: 어떤 예외도 앱 전체(빨간 화면)를 중단시키지 않는다.
+    try:
+        with st.spinner("전체 시장 급등주 스캔 중… (스냅샷 → 강도 압축 → 벌크 분석)"):
+            out = scan_momentum(scan_us=scan_us, scan_kr=scan_kr)
+    except Exception:
+        st.error("급등주 스캔 중 일시적인 오류가 발생했습니다. 잠시 후 '새로고침'을 눌러 다시 시도해주세요.")
+        return
 
-    results = out["results"]
-    render_stage_funnel(out["funnel"], title="단계별 필터 현황", elapsed=out.get("elapsed"))
+    if out.get("error"):
+        st.warning("급등주 데이터를 불러오는 중 문제가 발생했습니다. '새로고침'을 눌러 다시 시도해주세요.")
+        return
+
+    results = out.get("results") or []
+    if out.get("funnel"):
+        render_stage_funnel(out["funnel"], title="단계별 필터 현황", elapsed=out.get("elapsed"))
 
     if not results:
         st.info("현재 급등 신호(RVOL·거래대금 급증·갭·이벤트)에 해당하는 후보가 없습니다.")
@@ -352,5 +400,8 @@ def render_momentum_tab() -> None:
                     st.warning("이 종목 카드를 표시할 수 없습니다.")
                 news = it.get("news") or []
                 if news:
-                    with st.expander(f"📰 뉴스 {len(news)}건 (한국어)", expanded=False):
-                        render_news_section(news, key_prefix="mo", show_overall=False)
+                    try:
+                        with st.expander(f"📰 뉴스 {len(news)}건 (한국어)", expanded=False):
+                            render_news_section(news, key_prefix="mo", show_overall=False)
+                    except Exception:
+                        pass
