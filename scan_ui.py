@@ -44,10 +44,51 @@ def render_stage_funnel(
         f'<div style="color:#C5CAE9;font-size:0.9rem;font-weight:700;margin-bottom:8px;">'
         f'🔎 {head}</div>'
     ]
+
+    # 깔때기 진행: 'total' 개수에서 시작해 'reject' 단계마다 차감.
+    # 각 reject 필터에 대해 진입(차감 전 잔여)·통과(차감 후 잔여)·탈락(이번 제거)을 표기.
+    # → 탈락=0 이어도 '진입>0, 통과=진입' 으로 보이므로 "필터 미실행"과 명확히 구분된다.
+    remaining: int | None = None
     for label, count, kind in stages:
         color = _KIND_COLOR.get(kind, "#3A3A5C")
         lab = _html.escape(str(label))
-        emphasis = "font-weight:800;font-size:1.05rem;" if kind in ("total", "pass") else "font-weight:600;"
+
+        if kind == "total":
+            remaining = count
+            rows.append(
+                '<div style="display:flex;align-items:center;justify-content:space-between;'
+                'padding:5px 8px;margin:3px 0;border-radius:7px;background:#13131F;'
+                f'border-left:4px solid {color};">'
+                f'<span style="color:#B5B5D0;font-size:0.85rem;">{lab}</span>'
+                f'<span style="color:#E0E0FF;font-weight:800;font-size:1.05rem;">{count:,}</span>'
+                '</div>'
+            )
+            continue
+
+        if kind == "reject":
+            entered = remaining if remaining is not None else count
+            rejected = count
+            passed = max(entered - rejected, 0)
+            remaining = passed
+            # 탈락 0 = 회색(이 필터를 모두 통과), 탈락>0 = 강조색
+            rej_col = "#7A4A5C" if rejected > 0 else "#3A3A5C"
+            rej_emph = "font-weight:700;" if rejected > 0 else "color:#6E6E8E;"
+            rows.append(
+                '<div style="display:flex;align-items:center;justify-content:space-between;'
+                'padding:5px 8px;margin:3px 0;border-radius:7px;background:#13131F;'
+                f'border-left:4px solid {rej_col};">'
+                f'<span style="color:#B5B5D0;font-size:0.85rem;">{lab}</span>'
+                '<span style="font-size:0.8rem;display:flex;gap:10px;align-items:center;">'
+                f'<span style="color:#7E84B0;">진입 {entered:,}</span>'
+                f'<span style="color:#7E84B0;">통과 {passed:,}</span>'
+                f'<span style="color:#E0A0B8;{rej_emph}">탈락 {rejected:,}</span>'
+                '</span>'
+                '</div>'
+            )
+            continue
+
+        # pass / info 등은 개수만 표기
+        emphasis = "font-weight:800;font-size:1.05rem;" if kind == "pass" else "font-weight:600;"
         rows.append(
             '<div style="display:flex;align-items:center;justify-content:space-between;'
             'padding:5px 8px;margin:3px 0;border-radius:7px;background:#13131F;'

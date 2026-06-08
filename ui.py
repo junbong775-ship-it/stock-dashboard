@@ -123,14 +123,29 @@ def _match_grade_filter(item: dict, selected: list[str]) -> bool:
 
 
 def _match_pattern_filter(item: dict, selected: list[str]) -> bool:
-    """선택된 패턴 중 감지된 것이 하나라도 있으면 True (OR 로직)."""
+    """선택된 패턴 중 감지된 것이 하나라도 있으면 True (OR 로직).
+
+    방어적: patterns 가 dict 가 아니거나 값이 튜플/불리언/딕셔너리 등
+    어떤 형태여도 예외 없이 안전하게 판정한다(필터에서 절대 죽지 않도록).
+    """
     if not selected:
         return True
-    _label_to_key = {v: k for k, v in _PATTERN_LABELS.items()}
     patterns = item.get('patterns', {})
+    if not isinstance(patterns, dict):
+        return False
+    _label_to_key = {v: k for k, v in _PATTERN_LABELS.items()}
     for label in selected:
         key = _label_to_key.get(label)
-        if key and patterns.get(key, (False,))[0]:
+        if not key:
+            continue
+        val = patterns.get(key)
+        if isinstance(val, (tuple, list)):
+            detected = bool(val) and bool(val[0])
+        elif isinstance(val, dict):
+            detected = bool(val.get('detected'))
+        else:
+            detected = bool(val)
+        if detected:
             return True
     return False
 
@@ -1169,9 +1184,9 @@ def render_scanner_tab() -> None:
                         ("ETF/SPAC 제외",      c_etf + c_spac, "reject"),
                         ("저가($2↓) 제외",     c_cheap, "reject"),
                         ("시총($100M↓) 제외",  c_mcap,  "reject"),
+                        ("데이터 없음",         c_nodata,"reject"),
                         ("거래량(10만↓) 제외", c_vol,   "reject"),
                         ("거래대금 제외",       c_liq,   "reject"),
-                        ("데이터 없음",         c_nodata,"reject"),
                         ("추세(정배열) 제외",   c_trend, "reject"),
                         ("금융 제외",           c_fin,   "reject"),
                         (stage_label,          len(prelim), "info"),
@@ -1406,9 +1421,9 @@ def render_scanner_tab() -> None:
             ("ETF/SPAC 제외",      c_etf + c_spac, "reject"),
             ("저가($2↓) 제외",     c_cheap,        "reject"),
             ("시총($100M↓) 제외",  c_mcap,         "reject"),
+            ("데이터 없음",         c_nodata,       "reject"),
             ("거래량(10만↓) 제외", c_vol,          "reject"),
             ("거래대금 제외",       c_liq,          "reject"),
-            ("데이터 없음",         c_nodata,       "reject"),
             ("추세(정배열) 제외",   c_trend,        "reject"),
             ("금융 제외",           c_fin,          "reject"),
             ("분석 실패 제외",      c_fail,         "reject"),
@@ -1476,6 +1491,23 @@ def render_scanner_tab() -> None:
         and _match_pattern_filter(r, pattern_sel)
     ]
 
+    # ── 필터 전/후 종목 수 + 진단 로그 ─────────────────────────────────────────
+    # results = 스캔을 통과한 *최종* 종목(보통 수십~수백). 필터는 이 최종 집합에만
+    # 적용되며, 유니버스(수천 종목)를 재렌더링하지 않는다. (요구 4·6)
+    _n_before = len(results)
+    _n_after  = len(filtered)
+    _filter_names: list[str] = []
+    if theme_sel:
+        _filter_names += [theme_display(t) for t in theme_sel]
+    if grade_sel:
+        _filter_names += [f"등급:{g}" for g in grade_sel]
+    if pattern_sel:
+        _filter_names += list(pattern_sel)
+    # 워크플로 콘솔 로그(요구 1): "[스캐너 결과 필터] 컵앤핸들 형성 → 23/210개"
+    if _filter_names:
+        print(f"[스캐너 결과 필터] {' + '.join(_filter_names)} "
+              f"→ {_n_after}/{_n_before}개", flush=True)
+
     _funnel = st.session_state.get("scanner_funnel")
     if _funnel:
         render_stage_funnel(
@@ -1511,24 +1543,17 @@ def render_scanner_tab() -> None:
         )
     st.divider()
 
-    # ── 검색 결과 헤더 ──────────────────────────────────────────────────────────
-    _active_parts: list[str] = []
-    if theme_sel:
-        _active_parts += [theme_display(t) for t in theme_sel]
-    if grade_sel:
-        _active_parts += [f"등급:{g}" for g in grade_sel]
-    if pattern_sel:
-        _active_parts += pattern_sel
-
-    if _active_parts:
-        _filter_summary = _html.escape(" + ".join(_active_parts))
+    # ── 검색 결과 헤더 (필터 전/후 종목 수 항상 표시 — 요구 6) ───────────────────
+    if _filter_names:
+        _filter_summary = _html.escape(" + ".join(_filter_names))
         st.markdown(
             f"<div style='background:#1A1A2E;border-left:3px solid #5C6BC0;"
             f"padding:10px 14px;border-radius:6px;margin-bottom:12px;'>"
             f"<span style='color:#8888AA;font-size:0.82rem;'>적용 필터</span>&nbsp;&nbsp;"
             f"<span style='color:#C5CAE9;font-size:0.88rem;font-weight:600;'>{_filter_summary}</span>"
             f"&nbsp;&nbsp;<span style='color:#7986CB;font-size:0.88rem;'>|</span>&nbsp;&nbsp;"
-            f"<span style='color:#E0E0FF;font-size:0.95rem;font-weight:700;'>검색 결과: {len(filtered)}개</span>"
+            f"<span style='color:#E0E0FF;font-size:0.95rem;font-weight:700;'>"
+            f"필터 전 {_n_before:,}개 → 필터 후 {_n_after:,}개</span>"
             f"</div>",
             unsafe_allow_html=True,
         )
@@ -1536,8 +1561,9 @@ def render_scanner_tab() -> None:
         st.markdown(
             f"<div style='background:#1A1A2E;border-left:3px solid #5C6BC0;"
             f"padding:10px 14px;border-radius:6px;margin-bottom:12px;'>"
-            f"<span style='color:#8888AA;font-size:0.82rem;'>전체 결과</span>&nbsp;&nbsp;"
-            f"<span style='color:#E0E0FF;font-size:0.95rem;font-weight:700;'>검색 결과: {len(filtered)}개</span>"
+            f"<span style='color:#8888AA;font-size:0.82rem;'>전체 결과 (필터 없음)</span>&nbsp;&nbsp;"
+            f"<span style='color:#E0E0FF;font-size:0.95rem;font-weight:700;'>"
+            f"필터 전 {_n_before:,}개 → 필터 후 {_n_after:,}개</span>"
             f"</div>",
             unsafe_allow_html=True,
         )
@@ -1546,11 +1572,16 @@ def render_scanner_tab() -> None:
         if not results:
             st.info("조건에 맞는 종목이 없습니다. MA20 > MA60 > MA120 정배열 종목이 없거나 거래대금 조건을 확인하세요.")
         else:
+            _names = " + ".join(_filter_names) if _filter_names else "선택한 필터"
             st.warning(
-                "선택한 필터에 해당하는 종목이 없습니다.\n\n"
-                "다른 시장을 선택하거나 **필터 초기화** 버튼을 눌러보세요."
+                f"**조건에 맞는 종목 없음 (0개)**\n\n"
+                f"'{_names}' 에 해당하는 종목이 최종 결과 {_n_before:,}개 중 없습니다.\n\n"
+                "다른 패턴·시장을 선택하거나 사이드바의 **🔁 필터 초기화** 버튼을 눌러보세요."
             )
         return
+
+    # 렌더링 투명성(요구 4): 유니버스가 아니라 최종 통과 종목만 카드로 그린다.
+    st.caption(f"🃏 카드 렌더링: {_n_after:,}개 (최종 결과 {_n_before:,}개 기준 · 유니버스 재렌더링 아님)")
 
     # ── 전략 분류 (리서치 뷰 1회 계산 후 태그 부여) ────────────────────────────
     enriched: list[tuple] = []
