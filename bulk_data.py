@@ -193,18 +193,58 @@ def fetch_us_industry_map() -> dict[str, str]:
 # ──────────────────────────────────────────────────────────────────────────────
 # 한국 스냅샷 (FinanceDataReader)
 # ──────────────────────────────────────────────────────────────────────────────
+_KRX_CACHE_BASE = (
+    "https://raw.githubusercontent.com/FinanceData/fdr_krx_data_cache"
+    "/refs/heads/master/data/listing/krx"
+)
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _fetch_krx_listing_cache() -> pd.DataFrame:
+    """KRX 전체 상장 목록을 FinanceData GitHub 캐시(raw CSV)에서 로드.
+
+    `fdr.StockListing('KOSPI'/'KOSDAQ')` 가 의존하는 KRX 직접 엔드포인트는 이
+    데이터센터 IP에서 막혀 있고(getJsonData → HTTP 400), FDR 의 GitHub 캐시 경로도
+    **'오늘' 날짜 CSV가 아직 없으면 HTTP 404** 로 실패한다(장 마감 전/캐시 미갱신).
+    그래서 오늘부터 최대 10일 역순으로 '실제 존재하는 마지막 날짜'의 CSV를 찾아
+    가져온다. 컬럼: Code/Name/Market/Close/ChagesRatio/Volume/Amount/Marcap.
+    """
+    today = _dt.date.today()
+    for back in range(0, 10):
+        d = today - _dt.timedelta(days=back)
+        url = f"{_KRX_CACHE_BASE}/{d.isoformat()}.csv"
+        try:
+            df = pd.read_csv(url, dtype={"Code": str, "MarketId": str})
+        except Exception:
+            continue
+        if df is not None and not df.empty and "Code" in df.columns:
+            return df
+    return pd.DataFrame()
+
+
 @st.cache_data(ttl=900, show_spinner=False)
 def fetch_kr_snapshot(market: str) -> dict[str, dict]:
     """코스피/코스닥 스냅샷. market in {'KOSPI','KOSDAQ'}.
 
     {code: {name, price, change_pct, volume, amount(거래대금 KRW), mcap, market}}.
     거래대금(Amount)·시총(Marcap)이 들어있어 스냅샷만으로 거래대금 필터가 가능하다.
+
+    1순위: `fdr.StockListing(market)` (배포 환경/장중 KRX 가용 시).
+    2순위: KRX 직접 호출이 막혔거나(400) 오늘자 캐시가 없을 때(404) → FinanceData
+           GitHub 캐시(`_fetch_krx_listing_cache`)에서 최신 가용 날짜를 시장별로 필터.
     """
     out: dict[str, dict] = {}
     try:
         df = fdr.StockListing(market)
     except Exception:
-        return out
+        df = None
+    # FDR 직접 경로 실패/빈 결과 → GitHub 캐시 폴백 (시장별 필터)
+    if df is None or getattr(df, "empty", True) or "Code" not in getattr(df, "columns", []):
+        full = _fetch_krx_listing_cache()
+        if full is not None and not full.empty and "Market" in full.columns:
+            want = "KOSPI" if market == "KOSPI" else "KOSDAQ"
+            # KOSDAQ 은 'KOSDAQ GLOBAL' 하위시장 포함 → startswith 로 매칭
+            df = full[full["Market"].astype(str).str.startswith(want)].copy()
     if df is None or df.empty or "Code" not in df.columns:
         return out
     for rec in df.to_dict("records"):

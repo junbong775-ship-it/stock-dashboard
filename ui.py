@@ -1204,6 +1204,24 @@ def render_scanner_tab() -> None:
 
     st.caption(f"대상: {sel_label}  ·  {total:,}종목")
 
+    # ── 🔍 유니버스 디버그 (시장 선택 검증) — 스캔 시작 직전 출력 ──────────────────
+    # KR 선택 시 실제 후보가 KRX 6자리 코드(market='kr')인지, US 선택 시 티커
+    # (market='us')인지 화면에서 즉시 확인. 점수/패턴 로직과 무관한 표시 전용.
+    with st.expander("🔍 디버그: 유니버스 검증", expanded=False):
+        st.write("market_choice =", market_choice)
+        st.write("universe =", sel_label)
+        st.write("candidate_count =", len(candidates))
+        st.write("us_rows =", len(us_rows), " | kr_rows =", len(kr_rows))
+        st.write(
+            "snapshot rows → us:", len(us_snap),
+            " kospi:", len(kospi_snap), " kosdaq:", len(kosdaq_snap),
+        )
+        _dbg_df = pd.DataFrame(
+            [{"code": c, "name": n, "market": m} for c, n, m, _s in candidates[:10]]
+        )
+        st.write("candidates.head():")
+        st.write(_dbg_df)
+
     # 스캔 버튼은 항상 표시 — 스냅샷 미수신 시 비활성화
     run_scan = st.button(
         "🔍 스캔 시작",
