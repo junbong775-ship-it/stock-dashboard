@@ -22,6 +22,17 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 
 
+def _run_sequential(fn, items, default) -> list[tuple]:
+    """스레드를 못 쓰는 환경용 순차 폴백. 결과 의미(길이·default 채움)는 병렬과 동일."""
+    out = []
+    for it in items:
+        try:
+            out.append((it, fn(it)))
+        except Exception:
+            out.append((it, default))
+    return out
+
+
 def gather_parallel(fn, items, *, max_workers: int = 8,
                     deadline_sec: float = 45.0, default=None) -> list[tuple]:
     """``items`` 각각에 ``fn``을 병렬 적용하고 ``(item, result)`` 리스트를 반환한다.
@@ -39,8 +50,18 @@ def gather_parallel(fn, items, *, max_workers: int = 8,
     ex: ThreadPoolExecutor | None = None
     try:
         workers = max(1, min(max_workers, len(items)))
-        ex = ThreadPoolExecutor(max_workers=workers)
-        fut_to_idx = {ex.submit(fn, it): i for i, it in enumerate(items)}
+        try:
+            ex = ThreadPoolExecutor(max_workers=workers)
+        except (RuntimeError, OSError):
+            # Streamlit Cloud 등 스레드 생성이 막힌 환경
+            # (`RuntimeError: can't start new thread`) → 순차 실행으로 폴백.
+            return _run_sequential(fn, items, default)
+        try:
+            fut_to_idx = {ex.submit(fn, it): i for i, it in enumerate(items)}
+        except (RuntimeError, OSError):
+            # 제출 도중 스레드 생성 실패 → 즉시 정리 후 순차 폴백.
+            ex.shutdown(wait=False, cancel_futures=True)
+            return _run_sequential(fn, items, default)
         pending = set(fut_to_idx)
         deadline = time.time() + deadline_sec
         while pending and time.time() < deadline:

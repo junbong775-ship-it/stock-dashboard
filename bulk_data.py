@@ -196,7 +196,7 @@ def _download_chunk(syms: tuple[str, ...], period: str) -> dict[str, pd.DataFram
     try:
         df = yf.download(
             list(syms), period=period, group_by="ticker",
-            threads=True, progress=False, auto_adjust=True,
+            threads=False, progress=False, auto_adjust=True,
         )
     except Exception as e:
         raise _ChunkFetchError(str(e))
