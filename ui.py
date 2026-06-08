@@ -1100,18 +1100,10 @@ def render_scanner_tab() -> None:
         kosdaq_snap = fetch_kr_snapshot("KOSDAQ")
         kr_meta     = get_kr_meta_dict()
 
-    us_by_exch: dict[str, list[dict]] = {"NASDAQ": [], "NYSE": [], "AMEX": []}
-    for _row in us_snap.values():
-        us_by_exch.setdefault(_row["exchange"], []).append(_row)
-
-    # (체크키, 라벨, 시장, 거래소/마켓키, 스냅샷 rows)
-    market_pools: list[tuple[str, str, str, str, list[dict]]] = [
-        ("chk_nasdaq", "🇺🇸 NASDAQ", "us", "NASDAQ", us_by_exch.get("NASDAQ", [])),
-        ("chk_nyse",   "🇺🇸 NYSE",   "us", "NYSE",   us_by_exch.get("NYSE", [])),
-        ("chk_amex",   "🇺🇸 AMEX",   "us", "AMEX",   us_by_exch.get("AMEX", [])),
-        ("chk_kospi",  "🇰🇷 KOSPI",  "kr", "KOSPI",  list(kospi_snap.values())),
-        ("chk_kosdaq", "🇰🇷 KOSDAQ", "kr", "KOSDAQ", list(kosdaq_snap.values())),
-    ]
+    # 시장별 통합 풀: US = NASDAQ+NYSE+AMEX, KR = KOSPI+KOSDAQ.
+    # 거래소 선택(체크박스)은 제거 — 상단 시장 탭(미국/한국)으로 단순화(모바일 대응).
+    us_rows = list(us_snap.values())
+    kr_rows = list(kospi_snap.values()) + list(kosdaq_snap.values())
 
     # ── 결과 필터 session_state 사전 초기화 ─────────────────────────────────
     # 위젯 렌더링 전에 초기화해야 default= 와 session_state 충돌이 없음
@@ -1125,15 +1117,6 @@ def render_scanner_tab() -> None:
     with st.sidebar:
         st.markdown("## 🚀 봉봉 트레이더 스캐너")
         st.caption("Momentum Trend Scanner")
-        st.divider()
-        st.markdown("### 📊 스캔 대상 시장")
-        checks: dict[str, bool] = {}
-        for key, label, _mkt, _xk, rows in market_pools:
-            checks[key] = st.checkbox(
-                f"{label}  ({len(rows):,}종목)",
-                value=(key == "chk_nasdaq"),
-                key=key,
-            )
         st.divider()
 
         # ── 결과 필터 (디스플레이 레벨) ────────────────────────────────────────
@@ -1182,21 +1165,36 @@ def render_scanner_tab() -> None:
             st.cache_data.clear()
             st.session_state.pop("scanner_results", None)
             st.session_state.pop("scanner_ran", None)
+            st.session_state.pop("scanner_cache", None)
             st.rerun()
+
+    # ── 시장 선택 (상단 탭: 🇺🇸 미국시장 / 🇰🇷 한국시장) ──────────────────────────
+    market_choice = st.segmented_control(
+        "시장 선택",
+        options=["us", "kr"],
+        format_func=lambda m: "🇺🇸 미국시장" if m == "us" else "🇰🇷 한국시장",
+        default="us",
+        key="scanner_market",
+        label_visibility="collapsed",
+    ) or "us"
+
+    if market_choice == "us":
+        sel_rows, sel_label = us_rows, "🇺🇸 미국시장 (NASDAQ · NYSE · AMEX)"
+    else:
+        sel_rows, sel_label = kr_rows, "🇰🇷 한국시장 (KOSPI · KOSDAQ)"
 
     # 선택 시장의 전체 후보 수집 (ETF/거래대금/시총 필터는 깔때기에서 — 탈락 수 집계)
     candidates: list[tuple[str, str, str, dict]] = []
-    for key, _label, mkt, _xk, rows in market_pools:
-        if not checks[key]:
-            continue
-        for row in rows:
-            code = row["code"] if mkt == "kr" else row["symbol"]
-            candidates.append((code, row.get("name") or code, mkt, row))
+    for row in sel_rows:
+        code = row["code"] if market_choice == "kr" else row["symbol"]
+        candidates.append((code, row.get("name") or code, market_choice, row))
 
     total = len(candidates)
-    selected_labels = [label for key, label, _m, _x, _r in market_pools if checks[key]]
+    selected_labels = [sel_label]
 
-    # 스캔 버튼은 항상 표시 — 시장 미선택 시 비활성화
+    st.caption(f"대상: {sel_label}  ·  {total:,}종목")
+
+    # 스캔 버튼은 항상 표시 — 스냅샷 미수신 시 비활성화
     run_scan = st.button(
         "🔍 스캔 시작",
         type="primary",
@@ -1206,29 +1204,37 @@ def render_scanner_tab() -> None:
     )
 
     if total == 0:
-        st.warning("스캔할 시장을 하나 이상 선택하세요. 왼쪽 사이드바에서 시장을 선택해 주세요.")
+        st.warning("시장 스냅샷을 불러오지 못했습니다. 잠시 후 사이드바의 '🔄 캐시 새로고침'을 눌러 다시 시도해 주세요.")
         return
 
-    if not run_scan and not st.session_state.get("scanner_ran"):
-        markets_str = "  ·  ".join(selected_labels)
-        st.info(f"📌 **스캔 시작** 버튼을 클릭하면 **{total}개 종목**을 스캔합니다.\n\n대상: {markets_str}")
+    # ── 결과 캐시(10분) ─────────────────────────────────────────────────────────
+    # 같은 시장을 10분 내 다시 보면 재스캔 없이 즉시 표시(시장 전환 후 복귀 포함).
+    _SCAN_CACHE_TTL = 600
+    _scan_cache: dict = st.session_state.setdefault("scanner_cache", {})
+    _entry = _scan_cache.get(market_choice)
+    _fresh = bool(_entry) and (time.time() - _entry.get("ts", 0) < _SCAN_CACHE_TTL)
+
+    if not run_scan and not _fresh:
+        st.info(f"📌 **스캔 시작** 버튼을 클릭하면 **{total:,}개 종목**을 스캔합니다.\n\n대상: {sel_label}")
         return
 
-    cache_key = f"scanner_results_{'_'.join(k for k,v in checks.items() if v)}"
-    if run_scan or st.session_state.get("scanner_ran") != cache_key:
-        st.session_state["scanner_ran"] = cache_key
-        st.session_state.pop("scanner_benchmark", None)
-
-        # ── 깔때기: 스냅샷 사전필터 → 벌크 히스토리 → 정배열/AI 심층 ──
+    if run_scan:
+        # ── 깔때기: 스냅샷 사전필터(Stage 1) → 벌크 히스토리 → 정배열/AI 심층 ──
         prog_bar   = st.progress(0.0)
         funnel_box = st.empty()
         start_time = time.time()
 
         _MIN_DAILY_VALUE_KRW = 5_000_000_000    # 50억원 — 평균 거래대금 최소 기준 (미만이면 제외)
         _KRW_PER_USD         = 1_350            # USD→KRW 환산 기준
+        # Stage 1 사전필터 기준 (패턴 분석 전 컷)
+        _MIN_PRICE_USD  = 2.0                   # 주가 $2 이하 제외
+        _MIN_AVG_VOLUME = 100_000               # 평균 거래량 10만주 이하 제외
+        _MIN_MCAP_USD   = 100_000_000           # 시총 $1억 미만 제외
+        _MIN_MCAP_KRW   = _MIN_MCAP_USD * _KRW_PER_USD
 
         c_total  = len(candidates)
         c_etf = c_spac = c_liq = c_nodata = c_trend = c_fin = c_fail = 0
+        c_cheap = c_mcap = c_vol = 0
 
         # 단계별 소요 시간 측정용 (속도 진단).
         stage_t: dict[str, float] = {}
@@ -1242,13 +1248,16 @@ def render_scanner_tab() -> None:
             try:
                 render_stage_funnel(
                     [
-                        ("총 스캔",          c_total,  "total"),
-                        ("ETF/SPAC 제외",    c_etf + c_spac, "reject"),
-                        ("거래대금 제외",     c_liq,   "reject"),
-                        ("데이터 없음",       c_nodata,"reject"),
-                        ("추세(정배열) 제외", c_trend, "reject"),
-                        ("금융 제외",         c_fin,   "reject"),
-                        (stage_label,        len(prelim), "info"),
+                        ("총 스캔",            c_total,  "total"),
+                        ("ETF/SPAC 제외",      c_etf + c_spac, "reject"),
+                        ("저가($2↓) 제외",     c_cheap, "reject"),
+                        ("시총($100M↓) 제외",  c_mcap,  "reject"),
+                        ("거래량(10만↓) 제외", c_vol,   "reject"),
+                        ("거래대금 제외",       c_liq,   "reject"),
+                        ("데이터 없음",         c_nodata,"reject"),
+                        ("추세(정배열) 제외",   c_trend, "reject"),
+                        ("금융 제외",           c_fin,   "reject"),
+                        (stage_label,          len(prelim), "info"),
                     ],
                     title="단계별 필터 현황 (진행 중)",
                     container=funnel_box,
@@ -1274,7 +1283,16 @@ def render_scanner_tab() -> None:
                     else:
                         c_spac += 1
                     continue
-                # 시가총액으로는 제외하지 않음 — US 거래대금은 Stage C에서 히스토리로 계산해 필터.
+                # Stage 1: 저가·소형주 사전 제외 (스냅샷에 price·mcap 존재 → 다운로드 전 컷).
+                _px = snap.get('price')
+                if _px is not None and _px <= _MIN_PRICE_USD:
+                    c_cheap += 1
+                    continue
+                _mc = snap.get('mcap')
+                if _mc is not None and _mc < _MIN_MCAP_USD:
+                    c_mcap += 1
+                    continue
+                # 평균 거래량은 스냅샷에 없어(스크리너 무거래량) Stage C 히스토리에서 계산.
             else:  # kr
                 if _is_kr_excluded(name):
                     c_etf += 1
@@ -1282,8 +1300,17 @@ def render_scanner_tab() -> None:
                 if (snap.get('amount') or 0.0) < _MIN_DAILY_VALUE_KRW:
                     c_liq += 1
                     continue
+                # Stage 1: 소형주·저거래량 사전 제외 (KR 스냅샷엔 mcap·volume 존재).
+                _mc = snap.get('mcap') or 0.0
+                if _mc and _mc < _MIN_MCAP_KRW:
+                    c_mcap += 1
+                    continue
+                if (snap.get('volume') or 0.0) < _MIN_AVG_VOLUME:
+                    c_vol += 1
+                    continue
             prelim.append((code, name, mkt, snap))
 
+        n_prefiltered = len(prelim)   # Stage 1 통과(다운로드 대상) 수 = 필터 후 유니버스
         stage_t['스냅샷·사전필터'] = time.time() - _t_a0
         _t_b0 = time.time()
         _interim("심층 후보")
@@ -1340,9 +1367,14 @@ def render_scanner_tab() -> None:
                 if mkt == 'us':
                     if len(hist) >= 5:
                         t5 = hist.tail(5)
+                        avg_vol = float(t5['Volume'].mean())
                         avg_val = float((t5['Close'] * t5['Volume']).mean())
                     else:
-                        avg_val = 0.0
+                        avg_vol = avg_val = 0.0
+                    # Stage 1: 평균 거래량 10만주 미만 제외
+                    if avg_vol < _MIN_AVG_VOLUME:
+                        c_vol += 1
+                        continue
                     if avg_val * _KRW_PER_USD < _MIN_DAILY_VALUE_KRW:
                         c_liq += 1
                         continue
@@ -1439,6 +1471,9 @@ def render_scanner_tab() -> None:
         funnel_stages = [
             ("총 스캔",            c_total,        "total"),
             ("ETF/SPAC 제외",      c_etf + c_spac, "reject"),
+            ("저가($2↓) 제외",     c_cheap,        "reject"),
+            ("시총($100M↓) 제외",  c_mcap,         "reject"),
+            ("거래량(10만↓) 제외", c_vol,          "reject"),
             ("거래대금 제외",       c_liq,          "reject"),
             ("데이터 없음",         c_nodata,       "reject"),
             ("추세(정배열) 제외",   c_trend,        "reject"),
@@ -1450,8 +1485,10 @@ def render_scanner_tab() -> None:
 
         benchmark = {
             'total': c_total, 'elapsed': total_elapsed,
+            'universe': c_total, 'filtered': n_prefiltered, 'final': len(results),
             'etf_excluded': c_etf, 'spac_excluded': c_spac,
-            'liquidity_excluded': c_liq,
+            'price_excluded': c_cheap, 'mcap_excluded': c_mcap,
+            'volume_excluded': c_vol, 'liquidity_excluded': c_liq,
             'null_count': c_nodata, 'trend_excluded': c_trend,
             'financial_excluded': c_fin, 'fail_excluded': c_fail,
             'stage2_pass': len(results), 'with_patterns': with_patterns,
@@ -1459,17 +1496,24 @@ def render_scanner_tab() -> None:
         }
 
         results = _dedup_by_ticker(results)
-        st.session_state["scanner_results"]   = results
-        st.session_state["scanner_funnel"]    = funnel_stages
-        st.session_state["scanner_funnel_elapsed"] = total_elapsed
-        st.session_state["scanner_benchmark"] = benchmark
-    else:
-        results = st.session_state.get("scanner_results", [])
+        _entry = {
+            "results":   results,
+            "funnel":    funnel_stages,
+            "benchmark": benchmark,
+            "ts":        time.time(),
+        }
+        _scan_cache[market_choice] = _entry
 
-    results   = st.session_state.get("scanner_results", [])
-    benchmark = st.session_state.get("scanner_benchmark")
+    # (여기 도달 = 방금 스캔했거나 10분 내 캐시가 존재)
+    results        = _entry["results"]
+    funnel_stages  = _entry["funnel"]
+    benchmark      = _entry["benchmark"]
+    st.session_state["scanner_results"]        = results
+    st.session_state["scanner_funnel"]         = funnel_stages
+    st.session_state["scanner_funnel_elapsed"] = benchmark.get("elapsed")
+    st.session_state["scanner_benchmark"]      = benchmark
     # 세션에 이전(중복 제거 전) 결과가 남아있을 수 있어 방어적으로 한 번 더 적용
-    results   = _dedup_by_ticker(results)
+    results = _dedup_by_ticker(results)
 
     # ── 결과 필터 적용 (디스플레이 레벨) ───────────────────────────────────────
     theme_sel   = st.session_state.get("theme_multisel", [])
@@ -1490,6 +1534,11 @@ def render_scanner_tab() -> None:
             elapsed=st.session_state.get("scanner_funnel_elapsed"),
         )
     _bench = st.session_state.get("scanner_benchmark") or {}
+    if _bench.get("universe") is not None:
+        _mc1, _mc2, _mc3 = st.columns(3)
+        _mc1.metric("유니버스", f"{_bench.get('universe', 0):,}")
+        _mc2.metric("필터 통과", f"{_bench.get('filtered', 0):,}")
+        _mc3.metric("스캔 시간", f"{_bench.get('elapsed', 0):.1f}s")
     _stimes = _bench.get("stage_times") or {}
     if _stimes:
         _parts = "  ·  ".join(f"{k} {v:.1f}s" for k, v in _stimes.items())
