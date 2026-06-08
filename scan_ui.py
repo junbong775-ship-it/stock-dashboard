@@ -1,15 +1,16 @@
-"""스캐너 공용 UI — 단계별 탈락 깔때기(모바일 대응) + 장 세션 배지.
+"""스캐너 공용 UI — 단계별 탈락 깔때기(모바일 대응).
 
-봉봉 스캐너와 급등주 스캐너가 동일한 깔때기 패널/세션 배지를 쓰도록 한 곳에 모았다.
+봉봉 스캐너와 급등주 스캐너가 동일한 깔때기 패널을 쓰도록 한 곳에 모았다.
 모든 동적 문자열은 unsafe_allow_html 전에 escape 한다.
+
+※ 장 세션 배지/시장 라벨 바(`render_session_bar` 등)는 제거됐다 — 시장 선택은
+   봉봉 스캐너 탭의 단일 라디오 선택기(🇺🇸 미국 / 🇰🇷 한국)만 사용한다.
 """
 from __future__ import annotations
 
 import html as _html
 
 import streamlit as st
-
-from bulk_data import detect_session
 
 # 단계 종류별 색
 _KIND_COLOR = {
@@ -57,54 +58,3 @@ def render_stage_funnel(
         )
     rows.append('</div>')
     sink.markdown("".join(rows), unsafe_allow_html=True)
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# 장 세션 배지
-# ──────────────────────────────────────────────────────────────────────────────
-def session_badge_html(market: str, flag: str, name: str) -> str:
-    """단일 시장 세션 배지 HTML. market in {'us','kr'}."""
-    _code, en, ko, col = detect_session(market)
-    en_e = _html.escape(en)
-    ko_e = _html.escape(ko)
-    nm_e = _html.escape(name)
-    dot = "●" if _code != "CLOSED" else "○"
-    return (
-        '<span style="display:inline-flex;align-items:center;gap:6px;'
-        'background:#1A1A2E;border:1px solid #2E2E4E;border-radius:20px;'
-        'padding:4px 12px;margin:2px 8px 2px 0;font-size:0.82rem;">'
-        f'<span>{flag}</span>'
-        f'<span style="color:#9090B0;">{nm_e}</span>'
-        f'<span style="color:{col};font-weight:700;">{dot} {ko_e}</span>'
-        f'<span style="color:#5A5A78;font-size:0.7rem;">{en_e}</span>'
-        '</span>'
-    )
-
-
-def _market_label_html(flag: str, name: str) -> str:
-    """단순 시장 라벨(정적). 세션 감지/카운트다운/스레드 없음."""
-    nm_e = _html.escape(name)
-    return (
-        '<span style="display:inline-flex;align-items:center;gap:6px;'
-        'background:#1A1A2E;border:1px solid #2E2E4E;border-radius:20px;'
-        'padding:4px 12px;margin:2px 8px 2px 0;font-size:0.82rem;">'
-        f'<span>{flag}</span>'
-        f'<span style="color:#C5CAE9;font-weight:600;">{nm_e}</span>'
-        '</span>'
-    )
-
-
-def render_session_bar() -> None:
-    """단순 시장 라벨을 한 줄로 렌더(모든 탭 상단 공용).
-
-    이전의 장 세션 배지(`session_badge_html`/`detect_session` 기반, 카운트다운·
-    백그라운드 타이머 포함)는 Streamlit Cloud에서 `RuntimeError: can't start new
-    thread`를 유발해 **완전히 비활성화**했다. 스레드/타이머 없이 정적 라벨만 표시한다.
-    """
-    html = (
-        '<div style="margin:2px 0 10px 0;">'
-        + _market_label_html("🇺🇸", "미국시장")
-        + _market_label_html("🇰🇷", "한국시장")
-        + '</div>'
-    )
-    st.markdown(html, unsafe_allow_html=True)

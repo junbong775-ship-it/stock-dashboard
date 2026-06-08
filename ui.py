@@ -16,9 +16,9 @@ from data_provider import (
 )
 from bulk_data import (
     fetch_us_snapshot, fetch_us_industry_map, fetch_kr_snapshot,
-    bulk_history,
+    bulk_history, us_snapshot_is_degraded,
 )
-from scan_ui import render_stage_funnel, render_session_bar
+from scan_ui import render_stage_funnel
 from indicators import add_indicators
 from ai_engine import (
     calculate_ai_score, build_research_view,
@@ -528,7 +528,6 @@ def render_full_detail(label: str, data: dict) -> None:
 # Tab 1 — 종목 상세 분석
 # ══════════════════════════════════════════════════════════════════════════════════
 def render_analysis_tab() -> None:
-    render_session_bar()
     st.markdown("#### 종목 코드 또는 이름 입력")
     st.caption("예: `AAPL` · `005930` · `SK하이닉스` · `파두` · `카카오` · `LG전자`")
 
@@ -1093,12 +1092,13 @@ def _render_results_grid(enriched: list[tuple]) -> None:
 
 def render_scanner_tab() -> None:
     # 전체 시장 스냅샷 로딩 (캐시 15분) — 종목당 호출 없이 일괄 수집
-    render_session_bar()
+    _t_uni0 = time.time()
     with st.spinner("전체 시장 스냅샷 로딩 중…"):
         us_snap     = fetch_us_snapshot()
         kospi_snap  = fetch_kr_snapshot("KOSPI")
         kosdaq_snap = fetch_kr_snapshot("KOSDAQ")
         kr_meta     = get_kr_meta_dict()
+    _universe_load_sec = time.time() - _t_uni0
 
     # 시장별 통합 풀: US = NASDAQ+NYSE+AMEX, KR = KOSPI+KOSDAQ.
     # 거래소 선택(체크박스)은 제거 — 상단 시장 탭(미국/한국)으로 단순화(모바일 대응).
@@ -1168,18 +1168,28 @@ def render_scanner_tab() -> None:
             st.session_state.pop("scanner_cache", None)
             st.rerun()
 
-    # ── 시장 선택 (상단 탭: 🇺🇸 미국시장 / 🇰🇷 한국시장) ──────────────────────────
-    market_choice = st.segmented_control(
+    # ── 시장 선택 (단일 선택기: 🇺🇸 미국 / 🇰🇷 한국) ──────────────────────────────
+    # st.radio 는 항상 유효값을 반환하고 해제(None)가 없어 선택이 확실히 반영된다.
+    # (이전 st.segmented_control + `or "us"` 는 해제 시 None→US 로 되돌아가는 버그가 있었음.)
+    market_choice = st.radio(
         "시장 선택",
         options=["us", "kr"],
-        format_func=lambda m: "🇺🇸 미국시장" if m == "us" else "🇰🇷 한국시장",
-        default="us",
+        format_func=lambda m: ("🇺🇸 미국시장 (NASDAQ·NYSE·AMEX)" if m == "us"
+                               else "🇰🇷 한국시장 (KOSPI·KOSDAQ)"),
+        horizontal=True,
         key="scanner_market",
         label_visibility="collapsed",
-    ) or "us"
+    )
 
     if market_choice == "us":
         sel_rows, sel_label = us_rows, "🇺🇸 미국시장 (NASDAQ · NYSE · AMEX)"
+        if us_snapshot_is_degraded(us_snap):
+            st.warning(
+                "⚠️ NASDAQ 스냅샷 소스가 차단(HTTP 401)되어 **FDR 심볼 폴백**으로 동작 중입니다. "
+                "미국 종목 목록은 정상 표시되지만 **시총 사전필터가 비활성화**되고 "
+                "**가격은 다운로드 후 일봉 종가 기준**이라 스캔이 느려지고 프리마켓 시세가 반영되지 않을 수 있습니다.",
+                icon="⚠️",
+            )
     else:
         sel_rows, sel_label = kr_rows, "🇰🇷 한국시장 (KOSPI · KOSDAQ)"
 
@@ -1237,7 +1247,7 @@ def render_scanner_tab() -> None:
         c_cheap = c_mcap = c_vol = 0
 
         # 단계별 소요 시간 측정용 (속도 진단).
-        stage_t: dict[str, float] = {}
+        stage_t: dict[str, float] = {"유니버스 로딩": _universe_load_sec}
         _t_a0 = time.time()
 
         # US 업종 맵 (금융 필터/테마용, 24h 캐시, 비치명적). US 미선택 시 생략.
@@ -1347,13 +1357,15 @@ def render_scanner_tab() -> None:
         survivors = [(c, n, m, s) for c, n, m, s in prelim if c in hist_map]
         c_nodata  = len(prelim) - len(survivors)
 
-        stage_t['히스토리 다운로드'] = time.time() - _t_b0
+        stage_t['데이터 다운로드'] = time.time() - _t_b0
         _t_c0 = time.time()
 
         # ── Stage C: _build_result → 거래대금(US) → 정배열 → AI 심층 분석 ──
         results: list[dict] = []
         with_patterns = 0
         s2_total = len(survivors)
+        _ind_sec = 0.0   # 지표 계산 누적 시간
+        _pat_sec = 0.0   # 패턴 탐지(AI 점수) 누적 시간
         for i, (code, name, mkt, snap) in enumerate(survivors):
             try:
                 if i % 50 == 0:
@@ -1392,8 +1404,12 @@ def render_scanner_tab() -> None:
                     raw['sector']   = _m.get('market', '')
                     raw['industry'] = _m.get('industry', '')
 
+                _ti0 = time.time()
                 data   = add_indicators(raw)
+                _ind_sec += time.time() - _ti0
+                _tp0 = time.time()
                 scored = calculate_ai_score(data)
+                _pat_sec += time.time() - _tp0
                 if any(isinstance(v, (tuple, list)) and v and v[0]
                        for v in scored.get('patterns', {}).values()):
                     with_patterns += 1
@@ -1427,7 +1443,8 @@ def render_scanner_tab() -> None:
                 c_fail += 1
                 continue
 
-        stage_t['심층 분석'] = time.time() - _t_c0
+        stage_t['지표 계산'] = _ind_sec
+        stage_t['패턴 탐지'] = _pat_sec
         _t_n0 = time.time()
 
         # 메모리 정리: 히스토리 맵은 분석이 끝나면 더 필요 없다 → 즉시 해제.
@@ -1483,6 +1500,14 @@ def render_scanner_tab() -> None:
         ]
         funnel_box.empty()
 
+        # 데이터 소스 표기 (실제 사용 중인 시세 출처)
+        if market_choice == 'us':
+            _data_source = ("FinanceDataReader 폴백 (NASDAQ 401 차단)"
+                            if us_snapshot_is_degraded(us_snap)
+                            else "NASDAQ 스크리너 (세션 스냅샷)")
+        else:
+            _data_source = "FinanceDataReader (KRX 스냅샷)"
+
         benchmark = {
             'total': c_total, 'elapsed': total_elapsed,
             'universe': c_total, 'filtered': n_prefiltered, 'final': len(results),
@@ -1493,6 +1518,10 @@ def render_scanner_tab() -> None:
             'financial_excluded': c_fin, 'fail_excluded': c_fail,
             'stage2_pass': len(results), 'with_patterns': with_patterns,
             'stage_times': stage_t,
+            'universe_load': _universe_load_sec,
+            'download_sec': stage_t.get('데이터 다운로드', 0.0),
+            'indicator_sec': _ind_sec, 'pattern_sec': _pat_sec,
+            'data_source': _data_source, 'updated_at': time.time(),
         }
 
         results = _dedup_by_ticker(results)
@@ -1538,11 +1567,27 @@ def render_scanner_tab() -> None:
         _mc1, _mc2, _mc3 = st.columns(3)
         _mc1.metric("유니버스", f"{_bench.get('universe', 0):,}")
         _mc2.metric("필터 통과", f"{_bench.get('filtered', 0):,}")
-        _mc3.metric("스캔 시간", f"{_bench.get('elapsed', 0):.1f}s")
-    _stimes = _bench.get("stage_times") or {}
-    if _stimes:
-        _parts = "  ·  ".join(f"{k} {v:.1f}s" for k, v in _stimes.items())
-        st.caption(f"⏱️ 단계별 소요: {_parts}  ·  합계 {_bench.get('elapsed', 0):.1f}s")
+        _mc3.metric("최종 통과", f"{_bench.get('final', 0):,}")
+        # 성능 분석: 단계별 소요 시간 (요구 B)
+        _p1, _p2, _p3, _p4, _p5 = st.columns(5)
+        _p1.metric("유니버스 로딩", f"{_bench.get('universe_load', 0):.1f}s")
+        _p2.metric("데이터 다운로드", f"{_bench.get('download_sec', 0):.1f}s")
+        _p3.metric("지표 계산", f"{_bench.get('indicator_sec', 0):.1f}s")
+        _p4.metric("패턴 탐지", f"{_bench.get('pattern_sec', 0):.1f}s")
+        _p5.metric("전체 스캔", f"{_bench.get('elapsed', 0):.1f}s")
+    # 데이터 소스 + 최종 업데이트 시각 (요구 E)
+    _src = _bench.get("data_source")
+    _upd = _bench.get("updated_at")
+    if _src or _upd:
+        import datetime as _dtmod
+        _upd_str = (_dtmod.datetime.fromtimestamp(_upd).strftime("%Y-%m-%d %H:%M:%S")
+                    if _upd else "—")
+        st.caption(
+            f"🛰️ 데이터 소스: **{_html.escape(str(_src or '—'))}**  ·  "
+            f"🕒 최종 업데이트: {_upd_str}  ·  "
+            f"📈 시세 기준: 세션 스냅샷(lastsale)/일봉 종가 — "
+            f"브로커 프리마켓 호가와 다를 수 있습니다(무료 데이터 한계)."
+        )
     st.divider()
 
     # ── 검색 결과 헤더 ──────────────────────────────────────────────────────────

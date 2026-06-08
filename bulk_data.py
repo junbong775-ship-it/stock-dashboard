@@ -19,6 +19,7 @@ pykrx 일괄 일봉은 이 환경에서 KRX 차단으로 동작하지 않아 사
 from __future__ import annotations
 
 import datetime as _dt
+import time as _time
 import warnings
 from zoneinfo import ZoneInfo
 
@@ -66,18 +67,62 @@ def _num(s) -> float | None:
 # ──────────────────────────────────────────────────────────────────────────────
 # 미국 스냅샷 (NASDAQ 스크리너)
 # ──────────────────────────────────────────────────────────────────────────────
-def _fetch_screener_exchange(exchange: str) -> list[dict]:
-    r = requests.get(
-        _SCREENER_URL,
-        params={"tableonly": "true", "limit": "10000", "exchange": exchange},
-        headers=_SCREENER_HEADERS,
-        timeout=20,
-    )
-    r.raise_for_status()
-    rows = (r.json() or {}).get("data", {}).get("table", {}).get("rows") or []
-    for row in rows:
-        row["_exchange"] = exchange
-    return rows
+def _fetch_screener_exchange(exchange: str, attempts: int = 3) -> list[dict]:
+    """NASDAQ 스크리너 한 거래소를 조회. 일시적 401/403/5xx·네트워크 오류는 짧은
+    백오프로 재시도한다(이 데이터센터 IP, 특히 Streamlit Cloud에서 api.nasdaq.com 이
+    간헐적으로 401 Unauthorized 를 반환하기 때문). 모든 시도 실패 시 예외를 올린다."""
+    last_exc: Exception | None = None
+    for i in range(max(1, attempts)):
+        try:
+            r = requests.get(
+                _SCREENER_URL,
+                params={"tableonly": "true", "limit": "10000", "exchange": exchange},
+                headers=_SCREENER_HEADERS,
+                timeout=20,
+            )
+            r.raise_for_status()
+            rows = (r.json() or {}).get("data", {}).get("table", {}).get("rows") or []
+            for row in rows:
+                row["_exchange"] = exchange
+            return rows
+        except Exception as exc:  # noqa: BLE001 — 재시도 후 호출측에서 폴백
+            last_exc = exc
+            if i < attempts - 1:
+                _time.sleep(0.8 * (i + 1))
+    raise last_exc if last_exc else RuntimeError("screener fetch failed")
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def _fdr_us_universe() -> dict[str, dict]:
+    """NASDAQ 스크리너가 차단(401)됐을 때 쓰는 미국 심볼 유니버스 폴백.
+
+    FinanceDataReader.StockListing 은 심볼·종목명·업종(한국어)만 제공하고 **가격·시총은
+    없다.** 따라서 폴백 엔트리는 price=None, mcap=None 으로 둔다 — 스캐너 Stage-1 의
+    가격/시총 게이트는 None 을 통과시키므로(다운로드 후 가격/거래량으로만 컷) 미국 결과가
+    '0' 으로 사라지지 않고, 다만 시총 사전필터가 비활성화돼 스캔이 느려질 수 있다.
+    change_pct=0.0 으로 둬 급등주 정렬이 None 으로 깨지지 않게 한다."""
+    out: dict[str, dict] = {}
+    for mkt in _US_EXCHANGES:
+        try:
+            df = fdr.StockListing(mkt)
+        except Exception:
+            continue
+        if df is None or df.empty or "Symbol" not in df.columns:
+            continue
+        for rec in df.to_dict("records"):
+            sym = str(rec.get("Symbol") or "").strip().upper()
+            if not sym or sym in out:
+                continue
+            out[sym] = {
+                "symbol":     sym,
+                "name":       str(rec.get("Name") or sym),
+                "price":      None,
+                "change_pct": 0.0,
+                "mcap":       None,
+                "exchange":   mkt,
+                "source":     "fdr_fallback",
+            }
+    return out
 
 
 @st.cache_data(ttl=900, show_spinner=False)
@@ -85,8 +130,10 @@ def fetch_us_snapshot() -> dict[str, dict]:
     """미국 전체(NASDAQ+NYSE+AMEX) 스냅샷. {symbol: {name, price, change_pct, mcap, exchange}}.
 
     가격(lastsale)·등락률(pctchange)은 현재 세션(프리/정규/애프터) 마지막 체결을 반영한다.
-    스크리너가 모두 차단되면 빈 dict 를 반환한다 → 호출측 스캐너는 후보 0으로 깔때기를
-    정상 렌더(미국 결과가 0이 될 수 있음). 한국(FDR)·분석 탭은 영향받지 않는다.
+    스크리너가 **모두 차단(401)되면 FinanceDataReader 심볼 유니버스로 폴백**한다 →
+    미국 결과가 0으로 사라지지 않는다(폴백은 price/mcap 이 없어 'source'='fdr_fallback'
+    표식이 붙고 시총 사전필터가 비활성화됨 — 호출측이 이 표식으로 경고 배너를 띄운다).
+    폴백마저 실패하면 빈 dict. 한국(FDR)·분석 탭은 영향받지 않는다.
     """
     out: dict[str, dict] = {}
     for exch in _US_EXCHANGES:
@@ -105,8 +152,19 @@ def fetch_us_snapshot() -> dict[str, dict]:
                 "change_pct": _num(row.get("pctchange")),
                 "mcap":       _num(row.get("marketCap")),
                 "exchange":   exch,
+                "source":     "screener",
             }
+    # 스크리너가 전부 차단(401) → FDR 심볼 폴백으로 미국 유니버스를 살린다.
+    if not out:
+        return _fdr_us_universe()
     return out
+
+
+def us_snapshot_is_degraded(snap: dict[str, dict]) -> bool:
+    """미국 스냅샷이 FDR 폴백(가격/시총 없음) 모드인지 여부. UI 경고 배너용."""
+    if not snap:
+        return False
+    return any(v.get("source") == "fdr_fallback" for v in snap.values())
 
 
 @st.cache_data(ttl=86400, show_spinner=False)
@@ -223,6 +281,73 @@ def _download_chunk(syms: tuple[str, ...], period: str) -> dict[str, pd.DataFram
     return res
 
 
+# ── 증분 히스토리 저장소 (전체 재다운로드 방지) ────────────────────────────────
+_TOPUP_PERIOD  = "3mo"   # 보유 종목은 최근 ~3개월만 받아 기존 데이터에 병합
+_MAX_HIST_ROWS = 520     # 약 2년(거래일 ~504) 분량만 유지
+_STORE_MAX     = 4500    # 메모리 상한(≈1GB Cloud): 초과 시 가장 오래된 항목부터 제거
+
+
+@st.cache_resource(show_spinner=False)
+def _history_store() -> dict[str, pd.DataFrame]:
+    """프로세스 수명 동안 유지되는 심볼별 OHLCV 저장소 {yf_symbol: df}.
+
+    st.cache_resource 는 TTL 없이 같은 앱 프로세스의 재실행/세션 간 공유된다.
+    반복 스캔에서 전체(2y) 재다운로드 대신 '최근 캔들만' 받아 병합하기 위한 캐시."""
+    return {}
+
+
+def _market_today(market: str):
+    tz = "Asia/Seoul" if market == "kr" else "America/New_York"
+    return _dt.datetime.now(ZoneInfo(tz)).date()
+
+
+def _last_session_date(market: str):
+    """최근 '거래일' 추정치(주말 보정). 토/일이면 직전 금요일로 되돌린다.
+
+    캘린더 '오늘'과 비교하면 주말·휴장일에는 마지막 봉(예: 금요일)이 항상 과거가 되어
+    매 스캔 불필요한 top-up 이 발생한다. 공휴일까지 완벽히 알 수는 없으나(휴장일엔
+    top-up 이 같은 봉을 돌려주는 무해한 재요청 1회뿐), 주말 보정만으로 대부분의
+    중복 다운로드를 제거한다."""
+    d  = _market_today(market)
+    wd = d.weekday()          # Mon=0 … Sun=6
+    if wd == 5:               # 토
+        d = d - _dt.timedelta(days=1)
+    elif wd == 6:             # 일
+        d = d - _dt.timedelta(days=2)
+    return d
+
+
+def _merge_hist(old: pd.DataFrame | None, new: pd.DataFrame | None,
+                max_rows: int = _MAX_HIST_ROWS) -> pd.DataFrame | None:
+    """기존 + 신규 캔들 병합. 분할/배당 재조정이 감지되면 None 반환(전체 재다운로드 신호).
+
+    겹치는 날짜의 종가가 어긋나면(중앙 상대오차 >1%) 과거 보유분이 옛 조정기준이라
+    그대로 이으면 이평선이 끊긴다 → None 을 돌려 호출측이 전체 재다운로드하게 한다."""
+    if old is None or old.empty:
+        return new
+    if new is None or new.empty:
+        return old
+    overlap = old.index.intersection(new.index)
+    if len(overlap) >= 1:
+        try:
+            o = old.loc[overlap, "Close"]
+            n = new.loc[overlap, "Close"]
+            rel = ((o - n).abs() / n.replace(0, pd.NA)).dropna()
+            if len(rel) and float(rel.median()) > 0.01:
+                return None   # 재조정 감지
+        except Exception:
+            pass
+    combined = pd.concat([old, new])
+    combined = combined[~combined.index.duplicated(keep="last")].sort_index()
+    return combined.tail(max_rows)
+
+
+def _prune_store(store: dict[str, pd.DataFrame]) -> None:
+    if len(store) > _STORE_MAX:
+        for k in list(store.keys())[: len(store) - _STORE_MAX]:
+            store.pop(k, None)
+
+
 def bulk_history(
     tickers: list[str],
     market: str,
@@ -231,42 +356,104 @@ def bulk_history(
     kr_suffix: dict[str, str] | None = None,
     progress=None,
 ) -> dict[str, pd.DataFrame]:
-    """청크 벌크 다운로드. 내부 코드 → OHLCV DataFrame 맵 반환(빈/실패 종목은 누락).
+    """증분 벌크 다운로드. 내부 코드 → OHLCV DataFrame 맵 반환(빈/실패 종목은 누락).
 
-    progress(done, total) 콜백으로 진척을 보고한다(UI 진행바용). ~10종목/초.
-    다운로드는 야후 서버측 상한(~10~12종목/초, IP당)에 막혀 동시성을 올려도
-    빨라지지 않으므로 순차 청크가 가장 빠르다. 대신 청크 단위 캐시(`_download_chunk`)로
-    반복 스캔 비용을 제거한다.
+    **전체 히스토리를 매 스캔 재다운로드하지 않는다.** 심볼별 저장소(`_history_store`)를
+    두고: ① 보유 없음 → 전체(2y) 다운로드, ② 보유했지만 최신 캔들이 오래됨 → 최근
+    `_TOPUP_PERIOD` 만 받아 병합(분할/배당 재조정 시 자동 전체 재다운로드), ③ 이미
+    당일치 보유 → 다운로드 생략. progress(done, total) 콜백은 '실제 다운로드 대상' 기준.
+
+    실제 네트워크 호출은 `_download_chunk`(청크 단위, 15분 캐시)가 담당하며 야후 서버측
+    상한(~10종목/초, IP당)에 막혀 순차 청크가 가장 빠르다.
     """
     out: dict[str, pd.DataFrame] = {}
     uniq: list[str] = list(dict.fromkeys(t for t in tickers if t))
-    total = len(uniq)
-    if total == 0:
+    if not uniq:
         return out
 
+    store = _history_store()
     sym_to_code: dict[str, str] = {}
     for code in uniq:
         sym_to_code[_yf_symbol(code, market, kr_suffix)] = code
 
-    done = 0
-    syms = list(sym_to_code.keys())
-    for i in range(0, len(syms), chunk):
-        batch = syms[i:i + chunk]
+    ref = _last_session_date(market)
+    need_full:  list[str] = []
+    need_topup: list[str] = []
+    for sym in sym_to_code:
+        cached = store.get(sym)
+        if cached is None or len(cached) < 20:
+            need_full.append(sym)
+            continue
         try:
-            chunk_res = _download_chunk(tuple(batch), period)
-        except _ChunkFetchError:
-            # 일시적 청크 실패 — 캐시되지 않았으므로 다음 스캔에서 재시도된다.
-            chunk_res = {}
-        for sym, sub in chunk_res.items():
-            code = sym_to_code.get(sym)
-            if code is not None:
-                out[code] = sub
-        done += len(batch)
-        if progress is not None:
+            last_date = cached.index[-1].date()
+        except Exception:
+            need_full.append(sym)
+            continue
+        if last_date >= ref:
+            continue          # 이미 최신 — 재사용
+        need_topup.append(sym)
+
+    dl_total = len(need_full) + len(need_topup)
+    done = 0
+
+    def _bump(n: int) -> None:
+        nonlocal done
+        done += n
+        if progress is not None and dl_total:
             try:
-                progress(min(done, total), total)
+                progress(min(done, dl_total), dl_total)
             except Exception:
                 pass
+
+    # ① 미보유 → 전체(2y) 다운로드
+    for i in range(0, len(need_full), chunk):
+        batch = need_full[i:i + chunk]
+        try:
+            res = _download_chunk(tuple(batch), period)
+        except _ChunkFetchError:
+            res = {}
+        for sym, sub in res.items():
+            store[sym] = sub
+        _bump(len(batch))
+
+    # ② 보유분 최신화 → 최근 구간만 받아 병합 (재조정 감지 종목은 별도 전체 재다운로드)
+    refetch_full: list[str] = []
+    for i in range(0, len(need_topup), chunk):
+        batch = need_topup[i:i + chunk]
+        try:
+            res = _download_chunk(tuple(batch), _TOPUP_PERIOD)
+        except _ChunkFetchError:
+            res = {}
+        for sym, sub in res.items():
+            merged = _merge_hist(store.get(sym), sub)
+            if merged is None:
+                refetch_full.append(sym)
+            else:
+                store[sym] = merged
+        _bump(len(batch))
+    for i in range(0, len(refetch_full), chunk):
+        batch = refetch_full[i:i + chunk]
+        try:
+            res = _download_chunk(tuple(batch), period)
+        except _ChunkFetchError:
+            res = {}
+        for sym, sub in res.items():
+            store[sym] = sub
+
+    if dl_total == 0 and progress is not None:
+        try:
+            progress(len(uniq), len(uniq))
+        except Exception:
+            pass
+
+    # 출력 조립을 먼저 한 뒤 가지치기 — 이번 스캔에서 '신선'으로 건너뛴(재삽입 안 된)
+    # 종목이 오래된 삽입순서 때문에 출력 전에 evict 되는 일을 방지한다.
+    for sym, code in sym_to_code.items():
+        df = store.get(sym)
+        if df is not None and len(df) >= 20:
+            out[code] = df
+
+    _prune_store(store)
     return out
 
 

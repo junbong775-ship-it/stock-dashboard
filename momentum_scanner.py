@@ -22,7 +22,7 @@ from bulk_data import (
     fetch_us_snapshot, fetch_kr_snapshot, fetch_us_industry_map, bulk_history,
 )
 from safe_exec import gather_parallel
-from scan_ui import render_stage_funnel, render_session_bar
+from scan_ui import render_stage_funnel
 from news_view import render_news_section
 # ETF/SPAC·한국 제외 판정은 메인 스캐너와 동일 규칙을 재사용한다.
 from ui import _is_etf_or_spac, _is_kr_excluded
@@ -349,7 +349,6 @@ def _card(it: dict) -> str:
 
 
 def render_momentum_tab() -> None:
-    render_session_bar()
     st.markdown("### 🔥 급등주 스캐너")
     st.caption(
         "전체 시장에서 RVOL·거래대금 급증·갭·뉴스/특이이벤트로 '급등 직전/초기'를 탐지합니다. "

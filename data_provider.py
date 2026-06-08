@@ -509,8 +509,11 @@ def _compose_summary_ko(headline_ko: str, label: str, score: float) -> str:
     return '\n'.join(lines)
 
 
+@st.cache_data(ttl=900, show_spinner=False)
 def _fetch_naver_news(code: str, count: int = 5) -> list[dict]:
-    """Fetch stock-specific Korean news via Google News RSS (company name search)."""
+    """Fetch stock-specific Korean news via Google News RSS (company name search).
+
+    15분 캐시 — 순차 뉴스 수집(safe_exec)이어도 반복 스캔 시 네트워크 호출을 생략한다."""
     try:
         import requests
         meta         = get_kr_meta_dict()
@@ -532,9 +535,12 @@ def _fetch_naver_news(code: str, count: int = 5) -> list[dict]:
         return []
 
 
+@st.cache_data(ttl=900, show_spinner=False)
 def _fetch_us_news(ticker: str, count: int = 5) -> list[dict]:
     """Fetch US stock-specific news via Google News RSS (Korean headline synthesized,
-    no translation service used)."""
+    no translation service used).
+
+    15분 캐시 — 순차 뉴스 수집(safe_exec)이어도 반복 스캔 시 네트워크 호출을 생략한다."""
     try:
         import requests
         url = (f"https://news.google.com/rss/search?"

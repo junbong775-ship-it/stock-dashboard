@@ -15,7 +15,6 @@ import news_sentiment as _sent
 from safe_exec import gather_parallel
 from data_provider import _fetch_us_news, _session_quote
 from news_view import render_news_section
-from scan_ui import render_session_bar
 
 
 # 테마별 큐레이션 유니버스 (시총 ≤ $10B 고성장 후보 중심)
@@ -253,7 +252,6 @@ def _card(it: dict) -> str:
 
 
 def render_growth_tab() -> None:
-    render_session_bar()
     st.markdown("### 🌱 미래 10배주 스캐너")
     st.caption(
         "AI·우주·국방·반도체·데이터센터·에너지·전력망·로봇·자율주행·양자 테마의 큐레이션 유니버스에서 "
