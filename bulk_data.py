@@ -388,6 +388,70 @@ def _prune_store(store: dict[str, pd.DataFrame]) -> None:
             store.pop(k, None)
 
 
+def live_symbol(code: str, market: str, kr_market: str = "") -> str:
+    """내부 코드 → 화면 표시용 실시간 재조회에 쓰는 야후 심볼.
+
+    US 는 클래스주 '.'→'-'(예: BRK.B→BRK-B), KR 은 보드(KOSPI/KOSDAQ)에 따라
+    .KS/.KQ 접미사를 붙인다. 보드 정보가 없으면 KOSPI(.KS) 로 가정한다.
+    """
+    if str(market).lower() == "kr":
+        suf = "KQ" if "KOSDAQ" in str(kr_market).upper() else "KS"
+        return f"{str(code).zfill(6)}.{suf}"
+    return str(code).upper().replace(".", "-")
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def fetch_live_quotes(symbols: tuple[str, ...],
+                      period: str = "5d", chunk: int = 80) -> dict[str, tuple[float, float]]:
+    """**최종 결과 종목(소수)만** 화면 출력 직전 현재가를 재조회한다.
+
+    7천 종목 전체 실시간은 비용/한계상 포기하고, 각 탭의 *최종 결과* 티커만 단일
+    벌크 일봉 다운로드로 다시 받아 표시 가격을 최신으로 갱신한다. 장중에는 yfinance
+    일봉의 마지막 봉이 실시간가로 갱신되므로 마지막 유효 종가 = 현재가에 근접하고,
+    직전 일봉 종가로 당일 등락률을 계산한다.
+
+    인자 `symbols` 는 이미 야후 형식으로 변환된 심볼 튜플(US='AAPL', KR='005930.KS').
+    반환 {symbol: (price, change_pct)}. 다운로드 실패 종목은 키가 없어 호출측이 기존
+    표시가를 유지한다. 잦은 리런(필터 토글 등)에 매번 네트워크를 때리지 않도록 60초만
+    캐시한다 — '항상 최신'을 유지하면서 응답성을 보존하는 타협.
+    """
+    out: dict[str, tuple[float, float]] = {}
+    syms = [s for s in dict.fromkeys(symbols) if s]
+    if not syms:
+        return out
+    for i in range(0, len(syms), chunk):
+        part = syms[i:i + chunk]
+        try:
+            df = yf.download(
+                part, period=period, group_by="ticker",
+                threads=False, progress=False, auto_adjust=True,
+            )
+        except Exception:
+            continue
+        if df is None or df.empty:
+            continue
+        multi = isinstance(df.columns, pd.MultiIndex)
+        for sym in part:
+            try:
+                if multi:
+                    if sym not in df.columns.get_level_values(0):
+                        continue
+                    sub = df[sym]
+                else:
+                    sub = df  # 단일 종목 배치
+                closes = sub["Close"].dropna()
+                if closes.empty:
+                    continue
+                price = float(closes.iloc[-1])
+                prev  = float(closes.iloc[-2]) if len(closes) >= 2 else price
+                chg   = ((price - prev) / prev * 100.0) if prev else 0.0
+                if price > 0:
+                    out[sym] = (price, chg)
+            except Exception:
+                continue
+    return out
+
+
 def bulk_history(
     tickers: list[str],
     market: str,

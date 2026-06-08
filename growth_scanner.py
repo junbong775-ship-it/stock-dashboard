@@ -13,7 +13,8 @@ import html as _html
 
 import news_sentiment as _sent
 from safe_exec import gather_parallel
-from data_provider import _fetch_us_news, _session_quote
+from data_provider import _fetch_us_news, _session_quote, display_quote
+from bulk_data import fetch_live_quotes, live_symbol
 from news_view import render_news_section
 
 
@@ -133,8 +134,12 @@ def _scan_one(ticker: str) -> dict | None:
 
         # 표시용 세션 시세(프리/정규/애프터) — 위에서 이미 받은 info 재사용(추가 호출 없음).
         # RS·점수는 일봉 close 기준을 유지하고, 화면 표시 price 만 세션 시세로 보정한다.
+        # 시세 우선순위는 공통 엔진(display_quote)으로 일원화(US-only 유니버스).
         sess_px, _sess_chg = _session_quote(info, close)
-        disp_price = sess_px if (sess_px and sess_px > 0) else close
+        disp_price, _ = display_quote(
+            "us", live_price=sess_px, live_change=_sess_chg,
+            hist_close=close, hist_change=None,
+        )
 
         return {
             "ticker":     ticker,
@@ -272,6 +277,17 @@ def render_growth_tab() -> None:
     if not results:
         st.info("현재 조건(시총 ≤ $10B)에 맞는 테마 후보가 없습니다.")
         return
+
+    # 화면 출력 직전 현재가 재조회 — 최종 테마 후보만 실시간 갱신(전체 실시간 X).
+    try:
+        _syms = [live_symbol(it.get("ticker", ""), "us") for it in results]
+        _q = fetch_live_quotes(tuple(dict.fromkeys(_syms)))
+        for _it, _sym in zip(results, _syms):
+            _hit = _q.get(_sym)
+            if _hit:
+                _it["price"] = _hit[0]
+    except Exception:
+        pass
 
     st.success(f"테마 후보 {len(results)}종목 (종합점수 내림차순)")
     COLS = 2

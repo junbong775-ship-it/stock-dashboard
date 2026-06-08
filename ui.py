@@ -12,11 +12,12 @@ from data_provider import (
     fetch_nasdaq_tickers, fetch_sp500_tickers, fetch_russell2000_tickers,
     fetch_kospi_tickers, fetch_kosdaq_tickers,
     get_kr_meta_dict, get_kr_yf_industry,
-    _build_result, _fetch_us_news, _fetch_naver_news,
+    _build_result, _fetch_us_news, _fetch_naver_news, display_quote,
 )
 from bulk_data import (
     fetch_us_snapshot, fetch_us_industry_map, fetch_kr_snapshot,
     bulk_history, us_snapshot_is_degraded,
+    fetch_live_quotes, live_symbol,
 )
 from scan_ui import render_stage_funnel
 from indicators import add_indicators
@@ -301,14 +302,6 @@ def _build_ai_summary(label: str, data: dict, scored: dict, research: dict) -> s
     else:
         parts.append("현재 뚜렷하게 감지된 매수 패턴은 없습니다.")
 
-    # 매매 플랜
-    el, eh = research['entry_low'], research['entry_high']
-    t1 = research['targets'][0]
-    parts.append(
-        f"권장 진입 구간은 **{el:,.2f} ~ {eh:,.2f}**, 손절가는 **{research['stop_loss']:,.2f}**, "
-        f"1차 목표가는 **{t1:,.2f}** 로 손익비는 약 **{research['risk_reward']:.1f} : 1** 입니다."
-    )
-
     a_ko, a_final, _ = action_view(research)
     parts.append(f"**최종 행동은 「{a_ko}」 — {a_final}** 입니다.")
 
@@ -316,7 +309,7 @@ def _build_ai_summary(label: str, data: dict, scored: dict, research: dict) -> s
 
 
 def _tech_detail_html(scored: dict, research: dict) -> str:
-    """상세분석용 기술 지표 카드 — 이평 기울기·데드크로스·거래량·손절근거·300일선 관점."""
+    """상세분석용 기술 지표 카드 — 이평 기울기·데드크로스·거래량."""
     slopes = research.get('ma_slopes', {}) or {}
 
     def _slope(key):
@@ -335,21 +328,6 @@ def _tech_detail_html(scored: dict, research: dict) -> str:
                  '감소': '#90A4AE', '보통': '#C8C8E8'}.get(vol, '#C8C8E8')
     vol_txt   = f'{vol} ({vol_ratio:.1f}x)' if vol and vol != '—' else '—'
 
-    basis    = research.get('stop_basis') or '—'
-    basis_ko = {'swing_low': '최근 스윙로우', 'ma20': 'MA20',
-                'atr2': 'ATR(14)×2', 'fallback': '폴백(-8%)'}.get(basis, basis)
-    stop     = research.get('stop_loss')
-    stop_txt = f'{stop:,.2f} · {basis_ko}' if isinstance(stop, (int, float)) else str(basis_ko)
-
-    dev = scored.get('ma300_dev_pct')
-    if isinstance(dev, (int, float)):
-        if dev >= 0:
-            ma300_col, ma300_txt = '#69F0AE', f'MA300 위 (+{dev:.1f}%) · 중장기 상승권'
-        else:
-            ma300_col, ma300_txt = '#FF8A80', f'MA300 아래 ({dev:.1f}%) · 회복 시도/주의'
-    else:
-        ma300_col, ma300_txt = '#9E9E9E', '—'
-
     def _row(label, value, vcol='#D5D5EE'):
         return (
             f'<div style="display:flex;justify-content:space-between;gap:10px;'
@@ -363,10 +341,6 @@ def _tech_detail_html(scored: dict, research: dict) -> str:
     c10, t10 = _slope('ma10')
     c20, t20 = _slope('ma20')
 
-    guard_row = ''
-    if research.get('buy_blocked'):
-        guard_row = _row('매수 가드', '실적 급락 + 이평 하락 + 데드크로스 → 매수 금지', '#FF5252')
-
     return (
         '<div style="background:#15151F;border:1px solid #2E2E4E;border-radius:12px;'
         'padding:14px 18px;margin-bottom:14px">'
@@ -377,9 +351,6 @@ def _tech_detail_html(scored: dict, research: dict) -> str:
         + _row('MA20 기울기', t20, c20)
         + _row('데드크로스 여부', dead_txt, dead_col)
         + _row('거래량 상태', vol_txt, vol_col)
-        + _row('손절 근거', stop_txt, '#FF8A80')
-        + _row('300일선 관점', ma300_txt, ma300_col)
-        + guard_row
         + '</div>'
     )
 
@@ -464,34 +435,7 @@ def render_full_detail(label: str, data: dict) -> None:
             unsafe_allow_html=True,
         )
 
-    st.markdown(_debug_block_html(data, research), unsafe_allow_html=True)
-
-    # ── 2) 매매 플랜 (진입 / 손절 / 목표 / 손익비) ────────────────────────────
-    def plan_card(title, value, sub, color):
-        return (
-            f'<div style="flex:1 1 150px;background:#1A1A28;border:1px solid #2E2E4E;'
-            f'border-radius:10px;padding:12px 14px">'
-            f'<div style="font-size:0.72rem;color:#8888AA">{title}</div>'
-            f'<div style="font-size:1.15rem;font-weight:700;color:{color};margin-top:3px">{value}</div>'
-            f'<div style="font-size:0.72rem;color:#777799;margin-top:1px">{sub}</div></div>'
-        )
-
-    st.markdown("##### 🎯 매매 플랜")
-    st.markdown(
-        '<div style="display:flex;flex-wrap:wrap;gap:10px;margin-bottom:6px">'
-        + plan_card("진입 구간 · Entry", f"{el:,.2f} ~ {eh:,.2f}", "눌림목 분할 매수 밴드", "#2196F3")
-        + plan_card("손절가 · Stop", f"{stop:,.2f}", f"{pct(stop):+.1f}% · 리스크 방어", "#FF5252")
-        + plan_card("손익비 · R/R", f"{rr:.1f} : 1", "1차 목표 기준", "#B388FF")
-        + '</div>'
-        + '<div style="display:flex;flex-wrap:wrap;gap:10px">'
-        + plan_card("목표가 ① T1", f"{t1:,.2f}", f"{pct(t1):+.1f}% · 단기", "#00C851")
-        + plan_card("목표가 ② T2", f"{t2:,.2f}", f"{pct(t2):+.1f}% · 중기", "#00C851")
-        + plan_card("목표가 ③ T3", f"{t3:,.2f}", f"{pct(t3):+.1f}% · 장기", "#00C851")
-        + '</div>',
-        unsafe_allow_html=True,
-    )
-
-    # ── 2-b) 기술 지표 상세 (이평 기울기 · 데드크로스 · 거래량 · 손절근거 · 300일선) ──
+    # ── 2) 기술 지표 상세 (이평 기울기 · 데드크로스 · 거래량) ────────────────────
     try:
         st.markdown("##### 🔬 기술 지표 상세")
         st.markdown(_tech_detail_html(scored, research), unsafe_allow_html=True)
@@ -587,6 +531,19 @@ def render_analysis_tab() -> None:
     grade  = scored['grade']
     price  = data.get('price', 0.0)
     change = data.get('change_pct', 0.0)
+
+    # 화면 출력 직전 현재가 재조회 — **표시(헤더)용 가격/등락률만** 최신화한다.
+    # data 는 건드리지 않는다: render_full_detail 이 data 로 점수/연구뷰를 재계산하므로
+    # data['price'] 를 바꾸면 점수/액션이 흔들려 'scoring 불변' 제약을 위반한다. 따라서
+    # 표시용 지역변수 price/change 만 덮어써 카드에 최신가를 보인다(get_data 15분 캐시 무관).
+    try:
+        _kr_board = get_kr_meta_dict().get(code, {}).get('market', '') if market == 'kr' else ''
+        _sym = live_symbol(code, market, _kr_board)
+        _q = fetch_live_quotes((_sym,))
+        if _q.get(_sym):
+            price, change = _q[_sym]
+    except Exception:
+        pass
 
     badge_col  = GRADE_COLOR.get(grade, '#9E9E9E')
     change_str = f"▲ +{change:.2f}%" if change >= 0 else f"▼ {change:.2f}%"
@@ -926,19 +883,6 @@ def _render_scanner_card(item: dict, research: dict | None, tags: list[str]) -> 
     else:
         strat_html = '<span style="color:#666">—</span>'
 
-    # 강세추세 세부패턴 칩 (터틀돌파/신고가근처/첫눌림목) — 강세추세 종목에만 표시
-    strong_pats = classify_strong_patterns(item) if 'STRONG' in tags else []
-    if strong_pats:
-        strong_html = ''.join(
-            f'<span style="display:inline-block;background:{STRONG_PATTERN_META[k][1]}22;'
-            f'color:{STRONG_PATTERN_META[k][1]};border:1px solid {STRONG_PATTERN_META[k][1]}66;'
-            f'border-radius:8px;padding:1px 8px;margin:0 4px 3px 0;font-size:0.72rem;'
-            f'font-weight:700">{_html.escape(STRONG_PATTERN_META[k][0])}</span>'
-            for k in strong_pats if k in STRONG_PATTERN_META
-        )
-    else:
-        strong_html = ''
-
     # 패턴
     det_labels = [
         _PATTERN_LABELS[k] for k, v in patterns.items()
@@ -946,35 +890,16 @@ def _render_scanner_card(item: dict, research: dict | None, tags: list[str]) -> 
     ]
     pat_html = _html.escape(', '.join(det_labels)) if det_labels else '<span style="color:#666">—</span>'
 
-    # 업종
-    industry_disp = _html.escape(s_industry or s_sector or ('업종 정보 없음' if is_kr else '정보 없음'))
-
-    # 테마 (다중)
-    themes = classify_themes(code, s_industry, s_sector)
-    if themes:
-        theme_html = ''.join(
-            f'<span style="display:inline-block;background:#23233A;color:#9FA8DA;'
-            f'border:1px solid #3A3A5C;border-radius:8px;padding:1px 7px;'
-            f'margin:0 4px 3px 0;font-size:0.7rem;font-weight:600">'
-            f'{_html.escape(theme_display(t))}</span>'
-            for t in themes
-        )
-    else:
-        theme_html = '<span style="color:#666">—</span>'
-
     # 액션 / 최종판단
-    action = research.get('action', 'WATCH')
     a_ko, a_final, a_col = action_view(research)
 
-    # 패턴 진행률 / 현재 국면 / 거래량 상태 (스펙 1·4)
+    # 패턴 진행률 / 거래량 상태
     pp_name, pp_pct, pp_phase = pattern_progress(patterns)
     pp_html = (
         f'{_html.escape(pp_name)} · {pp_pct:.0f}% '
         f'<span style="color:#8888AA;font-weight:400">({_html.escape(pp_phase)})</span>'
         if pp_name != '—' else '<span style="color:#666">—</span>'
     )
-    stage_code = research.get('stage', '')
-    s_ko, s_col, _s_desc = STAGE_META.get(stage_code, (stage_code or '—', '#9E9E9E', ''))
     vol_state = research.get('vol_state', '—')
     vol_ratio = research.get('vol_ratio', 0.0) or 0.0
     vol_str = (f'{_html.escape(str(vol_state))} ({vol_ratio:.1f}x)'
@@ -982,24 +907,11 @@ def _render_scanner_card(item: dict, research: dict | None, tags: list[str]) -> 
     vol_col = {'급증': '#FF7043', '증가': '#69F0AE',
                '감소': '#90A4AE', '보통': '#C8C8E8'}.get(vol_state, '#C8C8E8')
 
-    # 매매 플랜
-    el = research.get('entry_low'); eh = research.get('entry_high')
-    stop = research.get('stop_loss')
-    targets = research.get('targets') or []
-    t1 = targets[0] if len(targets) >= 1 else None
-    rr = research.get('risk_reward', 0.0) or 0.0
     p_col = _prob_color(score)
 
-    def _f(v):
-        return f"{v:,.2f}" if isinstance(v, (int, float)) else "—"
-
-    entry_str = f"{_f(el)} ~ {_f(eh)}" if el is not None and eh is not None else "—"
-
-    # MA300 이격도(%) / MA300 전략 여부(YES/NO)
-    dev = item.get('ma300_dev_pct')
-    dev_str  = f"{dev:+.2f}%" if isinstance(dev, (int, float)) else "—"
-    ma300_yn = "YES" if item.get('ma300_strategy') else "NO"
-    yn_col   = "#69F0AE" if item.get('ma300_strategy') else "#FF8A80"
+    # 현재가 표기: KR ₩(정수) / US $(소수 2자리), 시장 태그 동반
+    price_str = f"₩{price:,.0f}" if is_kr else f"${price:,.2f}"
+    mkt_tag   = "🇰🇷 KR" if is_kr else "🇺🇸 US"
 
     def _row(label, value_html, vcolor="#D5D5EE"):
         return (
@@ -1023,54 +935,49 @@ def _render_scanner_card(item: dict, research: dict | None, tags: list[str]) -> 
                  padding:2px 10px;border-radius:10px;font-size:0.8rem">{grade}</span>
   </div>
   <div style="display:flex;justify-content:space-between;align-items:baseline;margin:6px 0 8px">
-    <span style="font-size:1.18rem;font-weight:700;color:#FFF">{price:,.2f}</span>
+    <span style="font-size:1.18rem;font-weight:700;color:#FFF">{price_str}
+      <span style="font-size:0.7rem;font-weight:600;color:#8888AA;margin-left:6px">{mkt_tag}</span>
+    </span>
     <span style="font-size:0.88rem;font-weight:600;color:{chg_color}">{change_str}</span>
   </div>
   {_row("전략", strat_html)}
-  {_row("강세패턴", strong_html) if strong_html else ""}
   {_row("패턴", pat_html)}
   {_row("패턴 진행률", pp_html)}
-  {_row("업종", industry_disp)}
-  {_row("테마", theme_html)}
-  {_row("MA300 이격도", dev_str, "#FFD54F")}
-  {_row("MA300 전략", ma300_yn, yn_col)}
-  {_row("현재 국면", s_ko, s_col)}
   {_row("거래량 상태", vol_str, vol_col)}
   {_row("확률점수", f'{score}/100', p_col)}
-  {_row("매수구간", entry_str, "#64B5F6")}
-  {_row("손절가", _f(stop), "#FF8A80")}
-  {_row("목표가", _f(t1), "#69F0AE")}
-  {_row("손익비(R/R)", f'{rr:.1f} : 1', "#B388FF")}
   <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;
               margin-top:8px;padding:8px 10px;background:{a_col}1A;
               border:1px solid {a_col}55;border-radius:8px">
     <span style="color:#A0A0C0;font-size:0.74rem;font-weight:600">최종 행동</span>
     <span style="color:{a_col};font-size:1.0rem;font-weight:800">{a_ko}</span>
   </div>
-  <div style="display:flex;gap:14px;margin-top:8px;flex-wrap:wrap;">
-    <span style="font-size:0.72rem;color:#8888AA">밀집도 <b style="color:#C8C8E8">{spread:.2f}%</b></span>
-    <span style="font-size:0.72rem;color:#8888AA">RSI <b style="color:#C8C8E8">{rsi:.1f}</b></span>
-    <span style="font-size:0.72rem;color:#8888AA">MFI <b style="color:#C8C8E8">{mfi:.1f}</b></span>
-    <span style="font-size:0.72rem;color:#8888AA">거래대금 <b style="color:#C8C8E8">{tv_str}</b></span>
-  </div>
-  {_debug_block_html(item, research)}
 </div>""", unsafe_allow_html=True)
 
-    with st.expander("▼ 상세 보기 (지표 · 패턴 · 뉴스)"):
-        d1, d2, d3 = st.columns(3)
-        d1.metric("RSI (14)", f"{rsi:.1f}")
-        d2.metric("MFI (14)", f"{mfi:.1f}")
-        d3.metric("밀집도",    f"{spread:.2f}%")
+    with st.expander("▼ 상세 보기 (패턴 · 뉴스)"):
         _render_patterns(patterns)
-        with st.expander("🐛 패턴 원시 데이터 (디버그)"):
-            debug_lines = []
-            for k, v in patterns.items():
-                det, conf, desc = v if isinstance(v, tuple) and len(v) == 3 else (v, 0.0, '')
-                icon = "✅" if det else "⚪"
-                debug_lines.append(f"{icon} {k}: detected={det}, conf={conf:.2f}, desc={desc!r}")
-            st.code("\n".join(debug_lines), language=None)
         st.markdown("**📰 최신 뉴스 (최근 3일)**")
         render_news_section(news, key_prefix="sc")
+
+
+def _refresh_display_quotes(items: list[dict]) -> None:
+    """최종 결과 종목만 화면 출력 직전 현재가를 재조회해 표시 시세를 갱신한다.
+
+    7천 종목 전체 실시간이 아니라 *최종 통과 종목*(보통 ≤100)만 단일 벌크 일봉으로
+    다시 받아 카드가 항상 최신가를 보이게 한다. 점수·전략·패턴 등 분석 결과는 그대로
+    두고, 표시용 `session_price`/`session_change` 만 덮어쓴다. 실패한 종목은 기존
+    표시가를 유지(폴백)한다."""
+    if not items:
+        return
+    try:
+        syms = [live_symbol(it.get('code', ''), it.get('market', ''),
+                            it.get('kr_market', '')) for it in items]
+        quotes = fetch_live_quotes(tuple(dict.fromkeys(syms)))
+        for it, sym in zip(items, syms):
+            q = quotes.get(sym)
+            if q:
+                it['session_price'], it['session_change'] = q[0], q[1]
+    except Exception:
+        pass
 
 
 def _render_results_grid(enriched: list[tuple]) -> None:
@@ -1203,24 +1110,6 @@ def render_scanner_tab() -> None:
     selected_labels = [sel_label]
 
     st.caption(f"대상: {sel_label}  ·  {total:,}종목")
-
-    # ── 🔍 유니버스 디버그 (시장 선택 검증) — 스캔 시작 직전 출력 ──────────────────
-    # KR 선택 시 실제 후보가 KRX 6자리 코드(market='kr')인지, US 선택 시 티커
-    # (market='us')인지 화면에서 즉시 확인. 점수/패턴 로직과 무관한 표시 전용.
-    with st.expander("🔍 디버그: 유니버스 검증", expanded=False):
-        st.write("market_choice =", market_choice)
-        st.write("universe =", sel_label)
-        st.write("candidate_count =", len(candidates))
-        st.write("us_rows =", len(us_rows), " | kr_rows =", len(kr_rows))
-        st.write(
-            "snapshot rows → us:", len(us_snap),
-            " kospi:", len(kospi_snap), " kosdaq:", len(kosdaq_snap),
-        )
-        _dbg_df = pd.DataFrame(
-            [{"code": c, "name": n, "market": m} for c, n, m, _s in candidates[:10]]
-        )
-        st.write("candidates.head():")
-        st.write(_dbg_df)
 
     # 스캔 버튼은 항상 표시 — 스냅샷 미수신 시 비활성화
     run_scan = st.button(
@@ -1441,14 +1330,23 @@ def render_scanner_tab() -> None:
                     tv = float((t5['Close'] * t5['Volume']).mean())
                 else:
                     tv = 0.0
+                _disp_px, _disp_chg = display_quote(
+                    mkt,
+                    live_price=snap.get('price'),
+                    live_change=snap.get('change_pct'),
+                    hist_close=data.get('price'),
+                    hist_change=data.get('change_pct'),
+                )
                 item = {
                     'code': code, 'name': name, 'market': mkt,
                     'momentum':        mom,
                     'kr_market':       _m.get('market', ''),
                     'kr_industry':     _m.get('industry', ''),
                     'trading_value':   tv,
-                    'session_price':   snap.get('price'),
-                    'session_change':  snap.get('change_pct'),
+                    # 표시 시세는 공통 엔진(display_quote)으로 일원화한다 — US는 라이브
+                    # 스냅샷(lastsale) 우선, KR은 항상 히스토리(yfinance) 종가로 폴백.
+                    'session_price':   _disp_px,
+                    'session_change':  _disp_chg,
                     **data, **scored,
                 }
                 try:
@@ -1561,6 +1459,11 @@ def render_scanner_tab() -> None:
     st.session_state["scanner_benchmark"]      = benchmark
     # 세션에 이전(중복 제거 전) 결과가 남아있을 수 있어 방어적으로 한 번 더 적용
     results = _dedup_by_ticker(results)
+
+    # ── 화면 출력 직전 현재가 재조회 (최종 결과 종목만 실시간) ──────────────────
+    # 7천 종목 전체 실시간은 포기하되, 최종 통과 종목만 단일 벌크 일봉으로 다시 받아
+    # 표시 시세를 최신화한다(스캔 캐시가 10분 지나도 카드 가격은 항상 최신).
+    _refresh_display_quotes(results)
 
     # ── 결과 필터 적용 (디스플레이 레벨) ───────────────────────────────────────
     theme_sel   = st.session_state.get("theme_multisel", [])

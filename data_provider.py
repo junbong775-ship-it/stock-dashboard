@@ -837,6 +837,29 @@ def _session_quote(info: dict, daily_close: float | None) -> tuple[float | None,
     return None, None
 
 
+def display_quote(market, live_price, live_change, hist_close, hist_change):
+    """모든 탭(스캐너·급등주·미래10배주·상세분석) 공통의 '표시용 시세' 선택기.
+
+    한 곳에서만 시세 우선순위를 정의해 탭별 가격이 어긋나지 않게 한다.
+      · US: 라이브 세션가(NASDAQ 스냅샷 lastsale / yfinance .info 세션가)가 있으면
+            우선 사용, 없으면 일봉 종가로 폴백.
+      · KR: 무료 실시간 벌크 소스가 없고(KRX/pykrx 차단, 스냅샷 캐시는 수일 지연)
+            잘못된 시세보다 정확한 직전 일봉이 낫기 때문에 항상 yfinance 일봉 종가 사용.
+    반환: (표시가격, 표시등락률). 등락률은 매칭되는 소스의 값을 따른다.
+    """
+    def _f(x):
+        try:
+            return float(x) if x is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    lp, lc = _f(live_price), _f(live_change)
+    hp, hc = _f(hist_close), _f(hist_change)
+    if str(market).lower() == 'us' and lp and lp > 0:
+        return lp, (lc if lc is not None else hc)
+    return (hp or 0.0), (hc if hc is not None else 0.0)
+
+
 @st.cache_data(ttl=900, show_spinner=False)
 def get_data_us(ticker: str) -> dict | None:
     stock = None
@@ -895,15 +918,18 @@ def get_data_us(ticker: str) -> dict | None:
     try:
         result['market_session'] = str(info.get('marketState') or '').upper()
         daily_close = result.get('price')   # _build_result 가 넣어둔 일봉 마지막 종가
+        daily_chg   = result.get('change_pct')
         sess_px, sess_chg = _session_quote(info, daily_close)
-        if sess_px and sess_px > 0:
-            result['price'] = sess_px
-            if sess_chg is not None:
-                result['change_pct'] = sess_chg
-            elif daily_close and daily_close > 0:
-                # 세션 등락률·기준가가 모두 없을 때: price 와 일관되게 일봉 종가 기준으로
-                # 재계산해 '새 가격 vs 과거 일봉 등락률' 불일치를 방지.
-                result['change_pct'] = (sess_px - daily_close) / daily_close * 100.0
+        # 표시 시세는 다른 탭과 동일한 공통 엔진(display_quote)으로 일원화 — US는
+        # 세션 시세(라이브) 우선, 없으면 일봉 종가/등락률로 폴백. 세션가는 있는데
+        # 세션 등락률이 없으면 일봉 종가 기준으로 재계산해 가격/등락률 불일치를 막는다.
+        live_chg = sess_chg
+        if live_chg is None and sess_px and daily_close and daily_close > 0:
+            live_chg = (sess_px - daily_close) / daily_close * 100.0
+        result['price'], result['change_pct'] = display_quote(
+            'us', live_price=sess_px, live_change=live_chg,
+            hist_close=daily_close, hist_change=daily_chg,
+        )
     except Exception:
         pass
     return result

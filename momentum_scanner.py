@@ -17,9 +17,10 @@ import pandas as pd
 import html as _html
 
 import news_sentiment as _sent
-from data_provider import _fetch_us_news, _fetch_naver_news
+from data_provider import _fetch_us_news, _fetch_naver_news, display_quote
 from bulk_data import (
     fetch_us_snapshot, fetch_kr_snapshot, fetch_us_industry_map, bulk_history,
+    fetch_live_quotes, live_symbol,
 )
 from safe_exec import gather_parallel
 from scan_ui import render_stage_funnel
@@ -86,11 +87,20 @@ def _score_one(snap: dict, hist: pd.DataFrame, market: str) -> dict | None:
         except Exception:
             gap = 0.0
 
-        # 표시 시세는 세션 스냅샷(프리/정규/애프터) 우선
-        disp_price = snap.get("price") or close
-        disp_chg   = snap.get("change_pct")
-        if disp_chg is None:
-            disp_chg = 0.0
+        # 표시 시세는 공통 엔진(display_quote)으로 일원화 — US 스냅샷(lastsale) 우선,
+        # KR은 히스토리(yfinance) 종가/등락률. 시세 우선순위는 한 곳에서만 정의한다.
+        try:
+            _prev    = float(h["Close"].iloc[-2])
+            _hist_chg = (close - _prev) / _prev * 100.0 if _prev else 0.0
+        except Exception:
+            _hist_chg = 0.0
+        disp_price, disp_chg = display_quote(
+            market,
+            live_price=snap.get("price"),
+            live_change=snap.get("change_pct"),
+            hist_close=close,
+            hist_change=_hist_chg,
+        )
 
         # 거래대금(표시용, KRW 기준 정규화)
         if market == "us":
@@ -101,6 +111,7 @@ def _score_one(snap: dict, hist: pd.DataFrame, market: str) -> dict | None:
         return {
             "code": snap.get("code") or snap.get("symbol"),
             "market": market,
+            "kr_market": snap.get("market", "") if market == "kr" else "",
             "price": disp_price,
             "intraday": float(disp_chg),
             "rvol": rvol,
@@ -379,6 +390,18 @@ def render_momentum_tab() -> None:
         return
 
     results = out.get("results") or []
+    # 화면 출력 직전 현재가 재조회 — 최종 급등 후보만 실시간 갱신(전체 실시간 X).
+    if results:
+        try:
+            _syms = [live_symbol(it.get("code", ""), it.get("market", ""),
+                                 it.get("kr_market", "")) for it in results]
+            _q = fetch_live_quotes(tuple(dict.fromkeys(_syms)))
+            for _it, _sym in zip(results, _syms):
+                _hit = _q.get(_sym)
+                if _hit:
+                    _it["price"], _it["intraday"] = _hit[0], float(_hit[1])
+        except Exception:
+            pass
     if out.get("funnel"):
         render_stage_funnel(out["funnel"], title="단계별 필터 현황", elapsed=out.get("elapsed"))
 
