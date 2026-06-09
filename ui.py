@@ -1163,10 +1163,14 @@ def render_scanner_tab() -> None:
         _MIN_AVG_VOLUME = 100_000               # 평균 거래량 10만주 이하 제외
         _MIN_MCAP_USD   = 100_000_000           # 시총 $1억 미만 제외
         _MIN_MCAP_KRW   = _MIN_MCAP_USD * _KRW_PER_USD
+        # 심층분석(다운로드+점수) 후보 상한 — 사전필터 통과가 많아도 상위 N개만 분석.
+        _DEEP_CANDIDATE_CAP  = 250    # 다운로드/심층분석 대상 최대 수 (100~300 권장)
+        _DEEP_CANDIDATE_WARN = 500    # 사전필터 통과가 이 수를 넘으면 원인 로그
+        _MAX_OUTPUT          = 50     # 최종 출력 상한 (점수순 자동 컷오프)
 
         c_total  = len(candidates)
         c_etf = c_spac = c_liq = c_nodata = c_trend = c_fin = c_fail = 0
-        c_cheap = c_mcap = c_vol = 0
+        c_cheap = c_mcap = c_vol = c_capcut = 0
 
         # 단계별 소요 시간 측정용 (속도 진단).
         stage_t: dict[str, float] = {"유니버스 로딩": _universe_load_sec}
@@ -1184,6 +1188,7 @@ def render_scanner_tab() -> None:
                         ("ETF/SPAC 제외",      c_etf + c_spac, "reject"),
                         ("저가($2↓) 제외",     c_cheap, "reject"),
                         ("시총($100M↓) 제외",  c_mcap,  "reject"),
+                        ("심층 캡 초과 제외",   c_capcut,"reject"),
                         ("데이터 없음",         c_nodata,"reject"),
                         ("거래량(10만↓) 제외", c_vol,   "reject"),
                         ("거래대금 제외",       c_liq,   "reject"),
@@ -1242,7 +1247,40 @@ def render_scanner_tab() -> None:
                     continue
             prelim.append((code, name, mkt, snap))
 
-        n_prefiltered = len(prelim)   # Stage 1 통과(다운로드 대상) 수 = 필터 후 유니버스
+        n_prefiltered = len(prelim)   # Stage 1(기본 조건) 통과 수 — 심층분석 후보 원수
+
+        # ── 심층분석 후보 상한 적용 (다운로드 前 컷 — 과부하·속도 방지) ──
+        # US 스냅샷엔 거래량이 없어 거래량/RVOL 사전필터가 불가능 → 시총·주가만으로
+        # 거른 뒤에도 후보가 수천 개 남는다. 따라서 유동성 프록시(US=시총, KR=거래대금)
+        # 내림차순으로 정렬해 상위 _DEEP_CANDIDATE_CAP 개만 다운로드/심층분석한다.
+        if n_prefiltered > _DEEP_CANDIDATE_WARN:
+            _cause = ("US 스냅샷에 거래량이 없어 거래량/RVOL 사전필터를 적용하지 못함"
+                      " (시총·주가 범위만 적용 가능)"
+                      if market_choice == 'us'
+                      else "KR 거래대금·시총·거래량 필터 후에도 후보가 과다함")
+            print(f"[스캐너 경고] 심층분석 후보 {n_prefiltered:,}개 > "
+                  f"{_DEEP_CANDIDATE_WARN}개 (시장={market_choice}). 원인: {_cause}"
+                  f" → 상위 {_DEEP_CANDIDATE_CAP}개로 자동 컷오프.", flush=True)
+
+        def _cand_rank(t):
+            # 1순위: 유동성 프록시(KR=거래대금, US=시총). US 스냅샷이 열화(FDR 폴백)되어
+            # 시총이 비면 2순위 |등락률|로 의미 있는 순위를 유지한다.
+            _s = t[3]
+            _primary = (_s.get('amount') or 0.0) if t[2] == 'kr' else (_s.get('mcap') or 0.0)
+            _secondary = abs(_s.get('change_pct') or 0.0)
+            return (_primary, _secondary)
+
+        if n_prefiltered > _DEEP_CANDIDATE_CAP:
+            prelim.sort(key=_cand_rank, reverse=True)
+            c_capcut = n_prefiltered - _DEEP_CANDIDATE_CAP
+            prelim   = prelim[:_DEEP_CANDIDATE_CAP]
+
+        n_deep = len(prelim)   # 실제 심층분석(다운로드) 대상 수
+        print(f"[스캐너] 심층분석 후보: {n_deep:,}개 "
+              f"(기본필터 통과 {n_prefiltered:,}개"
+              + (f", 상한 초과 {c_capcut:,}개 컷오프)" if c_capcut else ")"),
+              flush=True)
+
         stage_t['스냅샷·사전필터'] = time.time() - _t_a0
         _t_b0 = time.time()
         _interim("심층 후보")
@@ -1386,6 +1424,15 @@ def render_scanner_tab() -> None:
         results.sort(key=lambda x: (x.get('ma300_strategy', False),
                                     x.get('score', 0)), reverse=True)
 
+        # ── 최종 출력 상한: 점수순 상위 _MAX_OUTPUT 개만 (자동 컷오프) ──
+        _n_scored = len(results)
+        if _n_scored > _MAX_OUTPUT:
+            results = results[:_MAX_OUTPUT]
+        print(f"[스캐너] 최종 출력: {len(results):,}개 "
+              f"(점수통과 {_n_scored:,}개"
+              + (f" → 상위 {_MAX_OUTPUT}개 컷오프)" if _n_scored > _MAX_OUTPUT else ")"),
+              flush=True)
+
         def _fetch_news_for(it):
             try:
                 if it['market'] == 'us':
@@ -1421,6 +1468,7 @@ def render_scanner_tab() -> None:
             ("ETF/SPAC 제외",      c_etf + c_spac, "reject"),
             ("저가($2↓) 제외",     c_cheap,        "reject"),
             ("시총($100M↓) 제외",  c_mcap,         "reject"),
+            ("심층 캡 초과 제외",   c_capcut,       "reject"),
             ("데이터 없음",         c_nodata,       "reject"),
             ("거래량(10만↓) 제외", c_vol,          "reject"),
             ("거래대금 제외",       c_liq,          "reject"),
@@ -1441,7 +1489,9 @@ def render_scanner_tab() -> None:
 
         benchmark = {
             'total': c_total, 'elapsed': total_elapsed,
-            'universe': c_total, 'filtered': n_prefiltered, 'final': len(results),
+            'universe': c_total, 'filtered': n_deep, 'final': len(results),
+            'prefilter_pass': n_prefiltered, 'deep_candidates': n_deep,
+            'capcut_excluded': c_capcut,
             'etf_excluded': c_etf, 'spac_excluded': c_spac,
             'price_excluded': c_cheap, 'mcap_excluded': c_mcap,
             'volume_excluded': c_vol, 'liquidity_excluded': c_liq,
@@ -1519,8 +1569,8 @@ def render_scanner_tab() -> None:
     if _bench.get("universe") is not None:
         _mc1, _mc2, _mc3 = st.columns(3)
         _mc1.metric("유니버스", f"{_bench.get('universe', 0):,}")
-        _mc2.metric("필터 통과", f"{_bench.get('filtered', 0):,}")
-        _mc3.metric("최종 통과", f"{_bench.get('final', 0):,}")
+        _mc2.metric("심층분석 대상", f"{_bench.get('deep_candidates', _bench.get('filtered', 0)):,}")
+        _mc3.metric("최종 출력", f"{_bench.get('final', 0):,}")
         # 성능 분석: 단계별 소요 시간 (요구 B)
         _p1, _p2, _p3, _p4, _p5 = st.columns(5)
         _p1.metric("유니버스 로딩", f"{_bench.get('universe_load', 0):.1f}s")
