@@ -1164,7 +1164,7 @@ def render_scanner_tab() -> None:
         _MIN_MCAP_USD   = 100_000_000           # 시총 $1억 미만 제외
         _MIN_MCAP_KRW   = _MIN_MCAP_USD * _KRW_PER_USD
         # 심층분석(다운로드+점수) 후보 상한 — 사전필터 통과가 많아도 상위 N개만 분석.
-        _DEEP_CANDIDATE_CAP  = 250    # 다운로드/심층분석 대상 최대 수 (100~300 권장)
+        _DEEP_CANDIDATE_CAP  = 300    # 다운로드/심층분석 대상 최대 수 (상한 300, 속도 우선)
         _DEEP_CANDIDATE_WARN = 500    # 사전필터 통과가 이 수를 넘으면 원인 로그
         _MAX_OUTPUT          = 50     # 최종 출력 상한 (점수순 자동 컷오프)
 
@@ -1188,7 +1188,7 @@ def render_scanner_tab() -> None:
                         ("ETF/SPAC 제외",      c_etf + c_spac, "reject"),
                         ("저가($2↓) 제외",     c_cheap, "reject"),
                         ("시총($100M↓) 제외",  c_mcap,  "reject"),
-                        ("심층 캡 초과 제외",   c_capcut,"reject"),
+                        (f"심층분석 상한({_DEEP_CANDIDATE_CAP}) 초과", c_capcut, "reject"),
                         ("데이터 없음",         c_nodata,"reject"),
                         ("거래량(10만↓) 제외", c_vol,   "reject"),
                         ("거래대금 제외",       c_liq,   "reject"),
@@ -1326,6 +1326,10 @@ def render_scanner_tab() -> None:
         s2_total = len(survivors)
         _ind_sec = 0.0   # 지표 계산 누적 시간
         _pat_sec = 0.0   # 패턴 탐지(AI 점수) 누적 시간
+        # ── 심층분석 시작 직전 로그 (요구사항: 통과/대상 수 명시) ──
+        print(f"[스캐너] 필터 통과: {n_prefiltered:,}개", flush=True)
+        print(f"[스캐너] 심층분석 대상: {s2_total:,}개 "
+              f"(상한 {_DEEP_CANDIDATE_CAP} · 다운로드 성공분)", flush=True)
         for i, (code, name, mkt, snap) in enumerate(survivors):
             try:
                 if i % 50 == 0:
@@ -1441,12 +1445,13 @@ def render_scanner_tab() -> None:
             except Exception:
                 return it['code'], []
 
-        news_targets = results[:100]
+        news_targets = results   # 이미 ≤50개 (최종 출력 상한)
         if news_targets:
             # 안전 병렬: 전체 마감시한 + shutdown(wait=False)로 무한 로딩/멈춤 방지.
+            # 속도 우선 — 워커↑·마감시한↓(10~20초 예산 보호). 시한 내 미수신 종목은 뉴스 없음.
             news_map = {}
             for _it, pair in gather_parallel(_fetch_news_for, news_targets,
-                                             max_workers=8, deadline_sec=45.0):
+                                             max_workers=12, deadline_sec=12.0):
                 if pair:
                     news_map[pair[0]] = pair[1]
             for it in results:
@@ -1457,6 +1462,12 @@ def render_scanner_tab() -> None:
 
         stage_t['뉴스 수집'] = time.time() - _t_n0
         total_elapsed = time.time() - start_time
+        # ── 스캔 요약 로그 (단계별 종목 수 + 소요 시간) ──
+        _stage_log = " · ".join(f"{k} {v:.1f}s" for k, v in stage_t.items())
+        print(
+            f"[스캐너 요약] 전체 {c_total:,} → 기본필터 통과 {n_prefiltered:,} → "
+            f"심층분석 {n_deep:,} → 최종 출력 {len(results):,}개 | "
+            f"총 {total_elapsed:.1f}s ({_stage_log})", flush=True)
         gc.collect()
         try:
             prog_bar.empty()
@@ -1468,7 +1479,7 @@ def render_scanner_tab() -> None:
             ("ETF/SPAC 제외",      c_etf + c_spac, "reject"),
             ("저가($2↓) 제외",     c_cheap,        "reject"),
             ("시총($100M↓) 제외",  c_mcap,         "reject"),
-            ("심층 캡 초과 제외",   c_capcut,       "reject"),
+            (f"심층분석 상한({_DEEP_CANDIDATE_CAP}) 초과", c_capcut, "reject"),
             ("데이터 없음",         c_nodata,       "reject"),
             ("거래량(10만↓) 제외", c_vol,          "reject"),
             ("거래대금 제외",       c_liq,          "reject"),
